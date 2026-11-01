@@ -1,0 +1,38 @@
+name: backend-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: edutrak
+          POSTGRES_PASSWORD: edutrak_ci_password
+          POSTGRES_DB: edutrak_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U edutrak -d edutrak_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://edutrak:edutrak_ci_password@localhost:5432/edutrak_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test (race)
+        run: go test ./... -race
+      - name: coverage
+        run: go test ./... -coverprofile=coverage.out
+      - name: build
+        run: go build ./...
