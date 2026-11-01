@@ -1,0 +1,31 @@
+# Local development databases only (fictitious credentials).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: edutrak
+      POSTGRES_PASSWORD: edutrak_dev_password
+      POSTGRES_DB: edutrak
+    ports:
+      - "5432:5432"
+    volumes:
+      - edutrak_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edutrak -d edutrak"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: edutrak
+      POSTGRES_PASSWORD: edutrak_dev_password
+      POSTGRES_DB: edutrak_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
+volumes:
+  edutrak_pg:

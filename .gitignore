@@ -1,0 +1,23 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Build and test output
+/bin/
+/tmp/
+*.exe
+*.test
+*.out
+coverage.html
+
+# Private evidence storage (never commit uploaded files)
+/data/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+CLAUDE.md
