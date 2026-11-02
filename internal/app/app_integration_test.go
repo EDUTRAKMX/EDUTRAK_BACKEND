@@ -41,13 +41,19 @@ type resp struct {
 
 func (c client) do(method, path, token, body string, hdr ...string) resp {
 	c.t.Helper()
+	return c.doFrom("192.0.2.10:4321", method, path, token, body, hdr...)
+}
+
+// doFrom is do with an explicit peer address (the TCP connection's RemoteAddr).
+func (c client) doFrom(remote, method, path, token, body string, hdr ...string) resp {
+	c.t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.RemoteAddr = "192.0.2.10:4321"
+	req.RemoteAddr = remote
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	for i := 0; i+1 < len(hdr); i += 2 {
-		req.Header.Set(hdr[i], hdr[i+1])
+		req.Header.Add(hdr[i], hdr[i+1])
 	}
 	rec := httptest.NewRecorder()
 	c.h.ServeHTTP(rec, req)
