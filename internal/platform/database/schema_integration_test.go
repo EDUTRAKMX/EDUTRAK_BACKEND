@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/edutrak/backend/internal/platform/database"
 	"github.com/edutrak/backend/internal/platform/database/dbtest"
@@ -144,7 +145,7 @@ func TestGradeScoreRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err = db.Q(ctx).Exec(ctx,
-				`INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, captured_by) VALUES ($1, $2, $3, $4::numeric, $5)`,
+				`INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, recorded_by) VALUES ($1, $2, $3, $4::numeric, $5)`,
 				uuid.New(), f.subjectEnrollment, f.unit, tt.score, f.teacher)
 			if tt.ok != (err == nil) {
 				t.Fatalf("score %s: err = %v, want ok=%v", tt.score, err, tt.ok)
@@ -157,7 +158,7 @@ func TestGradeUniquePerUnitAndScoreNotRounded(t *testing.T) {
 	db := dbtest.New(t)
 	ctx := context.Background()
 	f := buildAcademic(t, db)
-	ins := `INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, captured_by) VALUES ($1, $2, $3, $4::numeric, $5)`
+	ins := `INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, recorded_by) VALUES ($1, $2, $3, $4::numeric, $5)`
 	if _, err := db.Q(ctx).Exec(ctx, ins, uuid.New(), f.subjectEnrollment, f.unit, "89.99", f.teacher); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +240,7 @@ func TestForeignKeysRejectMissingReferences(t *testing.T) {
 	if _, err := db.Q(ctx).Exec(ctx, `UPDATE groups SET tutor_id = $2 WHERE id = $1`, groupID, f.teacher); err != nil {
 		t.Fatalf("groups.tutor_id with real user: %v", err)
 	}
-	_, err = db.Q(ctx).Exec(ctx, `INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, captured_by) VALUES ($1, $2, $3, 50, $4)`,
+	_, err = db.Q(ctx).Exec(ctx, `INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, recorded_by) VALUES ($1, $2, $3, 50, $4)`,
 		uuid.New(), uuid.New(), f.unit, f.teacher)
 	if err == nil || !strings.Contains(err.Error(), "foreign key") {
 		t.Fatalf("grade for unknown subject_enrollment: err = %v, want FK violation", err)
@@ -493,6 +494,9 @@ func TestMigration0005UpgradesExistingData(t *testing.T) {
 	mustExec(t, db, `INSERT INTO enrollments (id, student_id, group_id) VALUES ($1, $2, $3)`, enrollment, student, legacyGroup)
 	mustExec(t, db, `INSERT INTO teaching_assignments (id, group_id, subject_id, teacher_id) VALUES ($1, $2, $3, $4)`, assignment, legacyGroup, subject, teacher)
 	mustExec(t, db, `INSERT INTO subject_enrollments (id, enrollment_id, teaching_assignment_id) VALUES ($1, $2, $3)`, legacySE, enrollment, assignment)
+	legacyUnit, legacyGrade := uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO subject_units (id, subject_id, unit_number, name) VALUES ($1, $2, 1, 'Unidad 1')`, legacyUnit, subject)
+	mustExec(t, db, `INSERT INTO grades (id, subject_enrollment_id, subject_unit_id, score, captured_by) VALUES ($1, $2, $3, 79.99, $4)`, legacyGrade, legacySE, legacyUnit, teacher)
 
 	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
@@ -504,6 +508,17 @@ func TestMigration0005UpgradesExistingData(t *testing.T) {
 	_ = db.Q(ctx).QueryRow(ctx, `SELECT level FROM groups`).Scan(&groupLevel)
 	if curriculumLevel != 4 || groupLevel != 7 {
 		t.Fatalf("levels after upgrade = %d / %d, want 4 / 7", curriculumLevel, groupLevel)
+	}
+
+	// 0008 renames grades.captured_by/created_at without touching the data.
+	var gScore string
+	var gBy uuid.UUID
+	var gAt time.Time
+	if err := db.Q(ctx).QueryRow(ctx, `SELECT score::text, recorded_by, recorded_at FROM grades WHERE id = $1`, legacyGrade).Scan(&gScore, &gBy, &gAt); err != nil {
+		t.Fatal(err)
+	}
+	if gScore != "79.99" || gBy != teacher || gAt.IsZero() {
+		t.Fatalf("grade after upgrade = %s / %v / %v", gScore, gBy, gAt)
 	}
 
 	// 0007 backfills subject_enrollments.student_id from the legacy enrollment and defaults the rest.
@@ -587,5 +602,34 @@ func TestAcademicTablesMatchDictionary(t *testing.T) {
 	}
 	if columnsOf(t, db, "schedules")["weekday"] || columnsOf(t, db, "enrollments")["created_at"] {
 		t.Error("legacy columns weekday/created_at must not exist")
+	}
+}
+
+// TestGradesTableMatchesDictionary pins the grades columns of the official
+// data dictionary (migration 0008) and the integrity rules that already exist.
+func TestGradesTableMatchesDictionary(t *testing.T) {
+	db := dbtest.New(t)
+	have := columnsOf(t, db, "grades")
+	for _, c := range []string{"id", "subject_enrollment_id", "subject_unit_id", "score", "recorded_by", "recorded_at", "updated_at"} {
+		if !have[c] {
+			t.Errorf("grades is missing column %s", c)
+		}
+	}
+	for _, c := range []string{"captured_by", "created_at", "category"} {
+		if have[c] {
+			t.Errorf("grades must not have column %s", c)
+		}
+	}
+	var typ string
+	if err := db.Q(context.Background()).QueryRow(context.Background(),
+		`SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = 'grades'::regclass AND a.attname = 'score'`).Scan(&typ); err != nil || typ != "numeric(5,2)" {
+		t.Fatalf("score type = %q (%v), want numeric(5,2)", typ, err)
+	}
+	var uniques int
+	_ = db.Q(context.Background()).QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_constraint WHERE conrelid = 'grades'::regclass AND contype = 'u'
+		   AND conkey = (SELECT array_agg(attnum ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'grades'::regclass AND attname IN ('subject_enrollment_id','subject_unit_id'))`).Scan(&uniques)
+	if uniques != 1 {
+		t.Fatal("UNIQUE (subject_enrollment_id, subject_unit_id) is missing")
 	}
 }
