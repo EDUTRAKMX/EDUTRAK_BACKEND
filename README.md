@@ -11,7 +11,8 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Identity (login, refresh, logout, me, cambio y reset de contraseña, alta de usuarios, RBAC) | Implementado |
 | Audit (escritura en `audit_logs`) | Solo registro; sin endpoints de consulta |
 | Academic (catálogos, periodos, grupos, inscripciones, asignaciones docentes, horarios, inscripciones a materia, consultas por rol) | Implementado (`/api/academic/*`) |
-| Grades, Attendance, Justifications, Tutoring, Analytics | **No implementado** (solo tablas) |
+| Grades (captura y corrección de calificaciones, consulta por alumno y por asignación docente) | Implementado (`/api/grades`, `/api/students/{id}/grades`, `/api/teaching-assignments/{id}/grades`) |
+| Attendance, Justifications, Tutoring, Analytics | **No implementado** (solo tablas) |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
@@ -121,11 +122,68 @@ Errores propios: 409 `term_closed`, `invalid_term_transition`, `group_code_taken
 - `subject_enrollments` ya no guarda `enrollment_id` (el diccionario enlaza alumno ↔ asignación; migración `0007`); la pertenencia al grupo se valida al crear. `subject_enrollments.created_at` se conserva como extensión documentada del diccionario (auditoría de cuándo se inscribió). Repetir `POST /subject-enrollments` (con o sin `attempt_number`) responde 409 `subject_enrollment_exists` y nunca crea otro intento; un segundo intento legítimo solo puede ser en otra asignación de la misma materia (otro periodo). La inscripción masiva es idempotente.
 - Sin paginación: los listados devuelven todo lo visible para el rol.
 
+### Grades
+Todas las rutas exigen `Authorization: Bearer <access_token>`. La identidad del profesor sale **solo** del token; un `teacher_id` / `recorded_by` en el cuerpo se rechaza (400, campo desconocido). Las listas y detalles respetan **rol + relación con el recurso**; un `ADMIN` no obtiene expedientes por serlo (403).
+
+| Método | Ruta | Acceso |
+|---|---|---|
+| POST | `/api/grades` | TEACHER **responsable** de la asignación de esa inscripción (nadie más: ni DIRECTOR, TUTOR, STUDENT ni ADMIN) |
+| PATCH | `/api/grades/{id}` | el mismo profesor responsable (corrección) |
+| GET | `/api/grades/{id}` | el alumno dueño, el profesor de la asignación, el tutor del grupo, DIRECTOR |
+| GET | `/api/students/{id}/grades` | STUDENT: solo `id` propio · TEACHER: solo intentos de sus asignaciones · TUTOR: solo intentos de grupos que tutela · DIRECTOR: cualquier alumno · ADMIN: 403 |
+| GET | `/api/teaching-assignments/{id}/grades` | profesor de la asignación, tutor del grupo, DIRECTOR |
+
+```http
+POST /api/grades
+{"subject_enrollment_id":"…","subject_unit_id":"…","score":89.99}
+-> 201 {"id":"…","subject_enrollment_id":"…","subject_unit_id":"…","score":89.99,"category":"SA",
+        "recorded_by":"<profesor autenticado>","recorded_at":"…","updated_at":"…"}
+
+PATCH /api/grades/{id}        {"score":90}   -> 200 (mismo objeto; "score":90.00,"category":"DE")
+
+GET /api/students/{id}/grades
+-> 200 {"student_id":"…","data":[{"subject_enrollment_id":"…","teaching_assignment_id":"…","attempt_number":1,
+        "status":"ACTIVE","academic_term":{"id":"…","name":"2026-1"},"group_code":"2A",
+        "subject":{"id":"…","code":"MAT1","name":"…"},
+        "units":[{"subject_unit_id":"…","unit_number":1,"unit_name":"…",
+                  "grade":{"id":"…","score":0.00,"category":"NA","updated_at":"…"}},
+                 {"subject_unit_id":"…","unit_number":2,"unit_name":"…","grade":null}]}]}
+
+GET /api/teaching-assignments/{id}/grades
+-> 200 {"teaching_assignment_id":"…","group_id":"…","group_code":"2A","subject":{…},
+        "units":[{"id":"…","unit_number":1,"name":"…"},…],
+        "students":[{"subject_enrollment_id":"…","student":{"id":"…","institutional_number":"…","first_name":"…","last_name":"…"},
+                     "attempt_number":1,"status":"ACTIVE","units":[ /* una celda por unidad, mismo formato que arriba */ ]}]}
+```
+Una unidad **sin calificación** devuelve `"grade": null`; **nunca** se trata como 0.00 (un 0.00 capturado sí aparece como calificación). No se calculan promedios (ver decisiones abiertas).
+
+Errores: 400 cuerpo mal formado o campo desconocido (`invalid_body`) · 401 · 403 `forbidden` · 404 `grade_not_found`, `student_not_found`, `teaching_assignment_not_found` · 409 `grade_exists`, `term_closed`, `subject_enrollment_inactive` · 422 `invalid_score`, `invalid_score_precision`, `score_out_of_range`, `subject_enrollment_not_found`, `subject_unit_not_found`, `unit_not_in_subject`.
+
+**Reglas de Grades**
+- Escala 0–100 con a lo sumo dos decimales; se guarda exactamente como `NUMERIC(5,2)` (sin `float`: el dominio usa **centésimos enteros** y la API serializa el número con dos decimales exactos). Más de dos decimales significativos (`89.999`) se **rechaza**, nunca se redondea; ceros sobrantes (`90.000`) son el mismo valor. Se rechazan signo, exponente (`1e2`), `+`, comas y cualquier valor fuera de 0–100.
+- Categoría derivada del score exacto (no se almacena): `<80.00` NA · `80.00–89.99` SA · `90.00–99.99` DE · `100.00` AU. Fronteras probadas: 0.00 NA, 79.99 NA, 80.00 SA, 89.99 SA, 90.00 DE, 99.99 DE, 100.00 AU; −0.01 y 100.01 → 422.
+- Una calificación = un intento (`subject_enrollment`) + una unidad. `UNIQUE (subject_enrollment_id, subject_unit_id)` en PostgreSQL: un POST repetido o simultáneo → 409 y **no** sobrescribe; corregir se hace con PATCH. Los intentos de distintos periodos son inscripciones a materia distintas, así que no se mezclan.
+- Para capturar/corregir: la unidad pertenece a la materia de la asignación, la inscripción está `ACTIVE`, el periodo no está `closed` (409 `term_closed`; el periodo se bloquea `FOR SHARE` durante la escritura) y el profesor autenticado es el de la asignación **en ese momento** (si Academic cambia al profesor, el anterior pierde el acceso).
+- PATCH con el mismo valor es un no-op (sin escritura ni auditoría). `recorded_by` conserva a quien capturó; quién corrigió queda en la auditoría. Las correcciones concurrentes se serializan con bloqueo de fila (sin pérdida de actualizaciones).
+- Auditoría (misma transacción que el cambio, solo ids y valores): `grades.created` (`subject_enrollment_id`, `subject_unit_id`, `score`, `category`) y `grades.updated` (además `from`, `to`, `from_category`, `to_category`); el actor es el profesor autenticado.
+- Consultas sin N+1: la hoja de un alumno es 1 consulta; la tabla de una asignación son 3 consultas sin importar el tamaño del grupo.
+
+**Relación Grades ↔ Academic.** Grades no duplica reglas de Academic: lee `subject_enrollments`, `teaching_assignments`, `groups`, `academic_terms` y `subject_units` mediante el puerto `ports.Academic` (adaptador de solo lectura) y confía en que Academic ya validó que el alumno pertenece al grupo y la unidad a la materia del catálogo.
+
+**Migración `0008`**: renombra `grades.captured_by → recorded_by` y `created_at → recorded_at` (diccionario). `score NUMERIC(5,2)`, `CHECK 0–100` y `UNIQUE` ya existían desde `0003`; se probó BD vacía y upgrade con datos.
+
+**Decisiones abiertas de Grades**
+- **Promedios / calificación final por materia:** no se calculan ni se exponen (no hay política de ponderación confirmada; las unidades pendientes no cuentan como cero).
+- Quién puede capturar: solo el profesor responsable. Si el DIRECTOR (u otro rol) debe poder corregir, hay que confirmarlo.
+- Un profesor puede corregir sin límite de tiempo mientras el periodo no esté cerrado (no hay política de bloqueo por fechas documentada).
+- No existe borrado de calificaciones; una captura equivocada se corrige con PATCH.
+- El tutor puede ver la tabla completa de la asignación de su grupo, no solo sus tutorados; con grupos de un solo tutor es equivalente, confirmar si debe acotarse.
+
 Errores: `{"error":{"code","message","request_id"}}` — 400 cuerpo inválido, 422 validación, 401, 403, 404, 409, 429 (con `Retry-After`), 500.
 
 ## Estructura
 ```
-cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,audit}   migrations/
+cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,audit}   migrations/
 ```
 Cada módulo: `domain / application / ports / adapters`.
 
