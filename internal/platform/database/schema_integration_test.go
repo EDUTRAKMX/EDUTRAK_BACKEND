@@ -114,7 +114,7 @@ func buildAcademic(t *testing.T, db *database.DB) academicFixture {
 		{`INSERT INTO groups (id, career_id, academic_term_id, code, level) VALUES ($1, $2, $3, 'A1', 1)`, []any{group, career, term}},
 		{`INSERT INTO enrollments (id, student_id, group_id) VALUES ($1, $2, $3)`, []any{enrollment, f.student, group}},
 		{`INSERT INTO teaching_assignments (id, group_id, subject_id, teacher_id) VALUES ($1, $2, $3, $4)`, []any{assignment, group, subject, f.teacher}},
-		{`INSERT INTO subject_enrollments (id, enrollment_id, teaching_assignment_id) VALUES ($1, $2, $3)`, []any{f.subjectEnrollment, enrollment, assignment}},
+		{`INSERT INTO subject_enrollments (id, student_id, teaching_assignment_id) VALUES ($1, $2, $3)`, []any{f.subjectEnrollment, f.student, assignment}},
 		{`INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, opened_by) VALUES ($1, $2, '2026-02-02', $3)`, []any{f.session, assignment, f.teacher}},
 	}
 	for _, s := range steps {
@@ -488,7 +488,11 @@ func TestMigration0005UpgradesExistingData(t *testing.T) {
 	mustExec(t, db, `INSERT INTO careers (id, code, name) VALUES ($1, 'TIC', 'Tecnologias')`, career)
 	mustExec(t, db, `INSERT INTO subjects (id, code, name) VALUES ($1, 'MAT1', 'Matematicas')`, subject)
 	mustExec(t, db, `INSERT INTO curriculum_subjects (id, career_id, subject_id, term_number) VALUES ($1, $2, $3, 4)`, uuid.New(), career, subject)
-	mustExec(t, db, `INSERT INTO groups (id, career_id, academic_term_id, code, term_number) VALUES ($1, $2, $3, 'A1', 7)`, uuid.New(), career, term)
+	legacyGroup, student, teacher, enrollment, assignment, legacySE := uuid.New(), insertUser(t, db, "40000009"), insertUser(t, db, "30000009"), uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO groups (id, career_id, academic_term_id, code, term_number) VALUES ($1, $2, $3, 'A1', 7)`, legacyGroup, career, term)
+	mustExec(t, db, `INSERT INTO enrollments (id, student_id, group_id) VALUES ($1, $2, $3)`, enrollment, student, legacyGroup)
+	mustExec(t, db, `INSERT INTO teaching_assignments (id, group_id, subject_id, teacher_id) VALUES ($1, $2, $3, $4)`, assignment, legacyGroup, subject, teacher)
+	mustExec(t, db, `INSERT INTO subject_enrollments (id, enrollment_id, teaching_assignment_id) VALUES ($1, $2, $3)`, legacySE, enrollment, assignment)
 
 	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
 		t.Fatalf("upgrade to latest: %v", err)
@@ -500,6 +504,17 @@ func TestMigration0005UpgradesExistingData(t *testing.T) {
 	_ = db.Q(ctx).QueryRow(ctx, `SELECT level FROM groups`).Scan(&groupLevel)
 	if curriculumLevel != 4 || groupLevel != 7 {
 		t.Fatalf("levels after upgrade = %d / %d, want 4 / 7", curriculumLevel, groupLevel)
+	}
+
+	// 0007 backfills subject_enrollments.student_id from the legacy enrollment and defaults the rest.
+	var seStudent uuid.UUID
+	var attempt int
+	var seStatus string
+	if err := db.Q(ctx).QueryRow(ctx, `SELECT student_id, attempt_number, status FROM subject_enrollments WHERE id = $1`, legacySE).Scan(&seStudent, &attempt, &seStatus); err != nil {
+		t.Fatal(err)
+	}
+	if seStudent != student || attempt != 1 || seStatus != "ACTIVE" {
+		t.Fatalf("subject enrollment after upgrade = %v / %d / %s", seStudent, attempt, seStatus)
 	}
 
 	var reason *string
@@ -537,5 +552,40 @@ func TestWithinTxRollsBackOnError(t *testing.T) {
 	_ = db.Q(ctx).QueryRow(ctx, `SELECT count(*) FROM users WHERE id = $1`, id).Scan(&n)
 	if n != 0 {
 		t.Fatal("insert survived rollback")
+	}
+}
+
+// TestAcademicTablesMatchDictionary pins the academic columns defined by the
+// official data dictionary (migration 0007).
+func TestAcademicTablesMatchDictionary(t *testing.T) {
+	db := dbtest.New(t)
+	want := map[string][]string{
+		"careers":              {"id", "code", "name", "is_active"},
+		"subjects":             {"id", "code", "name", "is_active"},
+		"subject_units":        {"id", "subject_id", "unit_number", "name"},
+		"groups":               {"id", "academic_term_id", "career_id", "tutor_id", "code", "level"},
+		"enrollments":          {"id", "group_id", "student_id", "status", "enrolled_at"},
+		"teaching_assignments": {"id", "group_id", "subject_id", "teacher_id"},
+		"schedules":            {"id", "teaching_assignment_id", "day_of_week", "start_time", "end_time", "classroom"},
+	}
+	for table, cols := range want {
+		have := columnsOf(t, db, table)
+		for _, c := range cols {
+			if !have[c] {
+				t.Errorf("%s is missing column %s", table, c)
+			}
+		}
+	}
+	se := columnsOf(t, db, "subject_enrollments")
+	for _, c := range []string{"id", "student_id", "teaching_assignment_id", "attempt_number", "status"} {
+		if !se[c] {
+			t.Errorf("subject_enrollments is missing column %s", c)
+		}
+	}
+	if se["enrollment_id"] {
+		t.Error("subject_enrollments.enrollment_id should have been dropped")
+	}
+	if columnsOf(t, db, "schedules")["weekday"] || columnsOf(t, db, "enrollments")["created_at"] {
+		t.Error("legacy columns weekday/created_at must not exist")
 	}
 }

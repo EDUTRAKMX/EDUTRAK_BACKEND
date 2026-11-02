@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"time"
 
+	acadhttp "github.com/edutrak/backend/internal/academic/adapters/http"
+	acadpg "github.com/edutrak/backend/internal/academic/adapters/postgres"
+	acadapp "github.com/edutrak/backend/internal/academic/application"
 	auditpg "github.com/edutrak/backend/internal/audit/adapters/postgres"
 	idhttp "github.com/edutrak/backend/internal/identity/adapters/http"
 	idpg "github.com/edutrak/backend/internal/identity/adapters/postgres"
@@ -48,6 +51,21 @@ func NewIdentityService(db *database.DB, cfg config.Config) (*idapp.Service, err
 	})
 }
 
+// NewAcademicService builds the academic use cases on top of PostgreSQL.
+func NewAcademicService(db *database.DB) *acadapp.Service {
+	return acadapp.NewService(acadapp.Deps{
+		Catalog:            acadpg.NewCatalogRepository(db),
+		Terms:              acadpg.NewTermRepository(db),
+		Groups:             acadpg.NewGroupRepository(db),
+		Assignments:        acadpg.NewAssignmentRepository(db),
+		SubjectEnrollments: acadpg.NewSubjectEnrollmentRepository(db),
+		Users:              acadpg.NewUserDirectory(db),
+		Audit:              auditpg.NewRecorder(db),
+		Tx:                 db,
+		NewID:              uuid.New,
+	})
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -69,5 +87,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	idhttp.NewHandler(identity, cfg.TrustedProxies).Register(mux)
+	acadhttp.NewHandler(NewAcademicService(db), identity).Register(mux)
 	return httpx.Base(log, mux), nil
 }
