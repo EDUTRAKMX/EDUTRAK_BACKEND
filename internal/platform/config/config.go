@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // the institution timezone must load on hosts without a zoneinfo database
 )
 
 type Config struct {
@@ -28,6 +29,14 @@ type Config struct {
 	TrustedProxies []netip.Prefix
 	StorageDir     string
 	MaxEvidenceMB  int
+
+	// Attendance. AttendanceAllowAnyNetwork disables the network check for QR check-ins and
+	// is rejected when APP_ENV=production; an empty ALLOWED_NETWORKS otherwise allows nothing.
+	AttendanceAllowAnyNetwork  bool
+	AttendanceLateAfterMinutes int // default late threshold copied into each new session
+	AttendanceLatesPerAbsence  int // default "N lates = 1 absence" copied into each new session
+	InstitutionTimezone        string
+	InstitutionLocation        *time.Location // used to date attendance sessions
 
 	// Login throttling (in-memory, per process).
 	LoginMaxFailuresPerAccount int // failures per (account, client IP) per window
@@ -107,6 +116,37 @@ func Load(getenv func(string) string) (Config, error) {
 	// The IP limit is deliberately loose: a whole campus may share one public IP (NAT/proxy).
 	cfg.LoginMaxFailuresPerIP = positiveInt("LOGIN_MAX_FAILURES_PER_IP", "150")
 	cfg.LoginRateWindow = dur("LOGIN_RATE_WINDOW", "15m")
+
+	cfg.AttendanceLateAfterMinutes = positiveInt("ATTENDANCE_LATE_AFTER_MINUTES", "15")
+	cfg.AttendanceLatesPerAbsence = positiveInt("ATTENDANCE_LATES_PER_ABSENCE", "3")
+	cfg.InstitutionTimezone = opt("INSTITUTION_TIMEZONE", "America/Mexico_City")
+	if loc, err := time.LoadLocation(cfg.InstitutionTimezone); err != nil {
+		errs = append(errs, fmt.Errorf("INSTITUTION_TIMEZONE %q is not a valid IANA timezone", cfg.InstitutionTimezone))
+	} else {
+		cfg.InstitutionLocation = loc
+	}
+	if cfg.QRTokenTTL < 5*time.Second || cfg.QRTokenTTL > 5*time.Minute {
+		errs = append(errs, errors.New("QR_TOKEN_TTL must be between 5s and 5m"))
+	}
+	allowAny, err := strconv.ParseBool(opt("ATTENDANCE_ALLOW_ANY_NETWORK", "false"))
+	if err != nil {
+		errs = append(errs, errors.New("ATTENDANCE_ALLOW_ANY_NETWORK must be true or false"))
+	}
+	cfg.AttendanceAllowAnyNetwork = allowAny
+	if cfg.Env == "production" {
+		// Production must never fall back to "any network": it needs explicit institutional ranges.
+		if allowAny {
+			errs = append(errs, errors.New("ATTENDANCE_ALLOW_ANY_NETWORK cannot be enabled when APP_ENV=production"))
+		}
+		if len(cfg.AllowedNetworks) == 0 {
+			errs = append(errs, errors.New("ALLOWED_NETWORKS is required when APP_ENV=production"))
+		}
+		for _, n := range cfg.AllowedNetworks {
+			if n.Bits() == 0 {
+				errs = append(errs, fmt.Errorf("ALLOWED_NETWORKS contains %s, which matches every address", n))
+			}
+		}
+	}
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))

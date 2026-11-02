@@ -99,3 +99,60 @@ func TestParsePrefixes(t *testing.T) {
 		t.Fatalf("single IP should become /32, got %v", got[1])
 	}
 }
+
+func TestAttendanceDefaults(t *testing.T) {
+	cfg, err := Load(env(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AttendanceLateAfterMinutes != 15 || cfg.AttendanceLatesPerAbsence != 3 || cfg.AttendanceAllowAnyNetwork {
+		t.Fatalf("unexpected attendance defaults: %+v", cfg)
+	}
+	if cfg.InstitutionLocation == nil || cfg.InstitutionLocation.String() != "America/Mexico_City" {
+		t.Fatalf("location = %v", cfg.InstitutionLocation)
+	}
+	if len(cfg.AllowedNetworks) != 0 {
+		t.Fatal("no networks may be allowed by default")
+	}
+}
+
+func TestAttendanceConfigValidation(t *testing.T) {
+	prod := func(m map[string]string) { m["APP_ENV"] = "production" }
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+		want   string // empty = must load
+	}{
+		{"dev without networks loads (check-ins are simply denied)", func(m map[string]string) {}, ""},
+		{"production without networks fails", prod, "ALLOWED_NETWORKS is required"},
+		{"production with networks loads", func(m map[string]string) { prod(m); m["ALLOWED_NETWORKS"] = "192.0.2.0/24" }, ""},
+		{"production refuses allow-any", func(m map[string]string) {
+			prod(m)
+			m["ALLOWED_NETWORKS"] = "192.0.2.0/24"
+			m["ATTENDANCE_ALLOW_ANY_NETWORK"] = "true"
+		}, "cannot be enabled"},
+		{"production refuses 0.0.0.0/0", func(m map[string]string) { prod(m); m["ALLOWED_NETWORKS"] = "0.0.0.0/0" }, "matches every address"},
+		{"production refuses ::/0", func(m map[string]string) { prod(m); m["ALLOWED_NETWORKS"] = "192.0.2.0/24,::/0" }, "matches every address"},
+		{"development may allow any", func(m map[string]string) { m["ATTENDANCE_ALLOW_ANY_NETWORK"] = "true" }, ""},
+		{"bad allow-any value", func(m map[string]string) { m["ATTENDANCE_ALLOW_ANY_NETWORK"] = "maybe" }, "ATTENDANCE_ALLOW_ANY_NETWORK"},
+		{"qr ttl too short", func(m map[string]string) { m["QR_TOKEN_TTL"] = "1s" }, "QR_TOKEN_TTL"},
+		{"qr ttl too long", func(m map[string]string) { m["QR_TOKEN_TTL"] = "1h" }, "QR_TOKEN_TTL"},
+		{"qr ttl 60s ok", func(m map[string]string) { m["QR_TOKEN_TTL"] = "60s" }, ""},
+		{"zero late minutes", func(m map[string]string) { m["ATTENDANCE_LATE_AFTER_MINUTES"] = "0" }, "ATTENDANCE_LATE_AFTER_MINUTES"},
+		{"zero lates per absence", func(m map[string]string) { m["ATTENDANCE_LATES_PER_ABSENCE"] = "0" }, "ATTENDANCE_LATES_PER_ABSENCE"},
+		{"bad timezone", func(m map[string]string) { m["INSTITUTION_TIMEZONE"] = "Mars/Olympus" }, "INSTITUTION_TIMEZONE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := validEnv()
+			tt.mutate(m)
+			_, err := Load(env(m))
+			switch {
+			case tt.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+				t.Fatalf("want error containing %q, got %v", tt.want, err)
+			}
+		})
+	}
+}
