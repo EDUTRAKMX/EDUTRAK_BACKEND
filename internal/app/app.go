@@ -12,6 +12,9 @@ import (
 	acadpg "github.com/edutrak/backend/internal/academic/adapters/postgres"
 	acadapp "github.com/edutrak/backend/internal/academic/application"
 	auditpg "github.com/edutrak/backend/internal/audit/adapters/postgres"
+	gradeshttp "github.com/edutrak/backend/internal/grades/adapters/http"
+	gradespg "github.com/edutrak/backend/internal/grades/adapters/postgres"
+	gradesapp "github.com/edutrak/backend/internal/grades/application"
 	idhttp "github.com/edutrak/backend/internal/identity/adapters/http"
 	idpg "github.com/edutrak/backend/internal/identity/adapters/postgres"
 	idratelimit "github.com/edutrak/backend/internal/identity/adapters/ratelimit"
@@ -66,6 +69,17 @@ func NewAcademicService(db *database.DB) *acadapp.Service {
 	})
 }
 
+// NewGradesService builds the grades use cases on top of PostgreSQL.
+func NewGradesService(db *database.DB) *gradesapp.Service {
+	return gradesapp.NewService(gradesapp.Deps{
+		Grades:   gradespg.NewRepository(db),
+		Academic: gradespg.NewAcademicReader(db),
+		Audit:    auditpg.NewRecorder(db),
+		Tx:       db,
+		NewID:    uuid.New,
+	})
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -88,5 +102,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	})
 	idhttp.NewHandler(identity, cfg.TrustedProxies).Register(mux)
 	acadhttp.NewHandler(NewAcademicService(db), identity).Register(mux)
+	gradeshttp.NewHandler(NewGradesService(db), identity).Register(mux)
 	return httpx.Base(log, mux), nil
 }
