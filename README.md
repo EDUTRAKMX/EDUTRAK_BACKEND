@@ -12,7 +12,8 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Audit (escritura en `audit_logs`) | Solo registro; sin endpoints de consulta |
 | Academic (catálogos, periodos, grupos, inscripciones, asignaciones docentes, horarios, inscripciones a materia, consultas por rol) | Implementado (`/api/academic/*`) |
 | Grades (captura y corrección de calificaciones, consulta por alumno y por asignación docente) | Implementado (`/api/grades`, `/api/students/{id}/grades`, `/api/teaching-assignments/{id}/grades`) |
-| Attendance, Justifications, Tutoring, Analytics | **No implementado** (solo tablas) |
+| Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
+| Justifications, Tutoring, Analytics | **No implementado** (solo tablas) |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
@@ -27,7 +28,7 @@ go run ./cmd/api
 ```
 
 ## Variables
-`DATABASE_URL` y `JWT_SECRET` son obligatorias (el arranque falla sin ellas). Opcionales: `HTTP_PORT` (8080), `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `QR_TOKEN_TTL` (30s), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m), `ALLOWED_NETWORKS`, `TRUSTED_PROXIES`, `STORAGE_DIR`, `MAX_EVIDENCE_MB`, `APP_ENV`, `LOG_LEVEL`. Ver `.env.example`. Un archivo `.env` se carga si existe sin pisar variables ya definidas.
+`DATABASE_URL` y `JWT_SECRET` son obligatorias (el arranque falla sin ellas). Opcionales: `HTTP_PORT` (8080), `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `QR_TOKEN_TTL` (30s), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m), `ALLOWED_NETWORKS` (obligatoria en producción), `TRUSTED_PROXIES`, `ATTENDANCE_ALLOW_ANY_NETWORK` (solo dev), `ATTENDANCE_LATE_AFTER_MINUTES`, `ATTENDANCE_LATES_PER_ABSENCE`, `INSTITUTION_TIMEZONE`, `STORAGE_DIR`, `MAX_EVIDENCE_MB`, `APP_ENV`, `LOG_LEVEL`. Ver `.env.example`. Un archivo `.env` se carga si existe sin pisar variables ya definidas.
 
 ## Pruebas
 ```bash
@@ -179,11 +180,93 @@ Errores: 400 cuerpo mal formado o campo desconocido (`invalid_body`) · 401 · 4
 - No existe borrado de calificaciones; una captura equivocada se corrige con PATCH.
 - El tutor puede ver la tabla completa de la asignación de su grupo, no solo sus tutorados; con grupos de un solo tutor es equivalente, confirmar si debe acotarse.
 
+### Attendance (`/api/attendance`)
+Todas las rutas exigen `Authorization: Bearer <access_token>`. La autorización es **rol + relación con el recurso** y se decide en los casos de uso; el alumno que registra es siempre el del token (cualquier `student_id`, `ip`, hora o `status` en el cuerpo del check-in → 400). ADMIN no obtiene asistencia por serlo (403). Rutas relativas a `/api/attendance`.
+
+| Método | Ruta | Acceso |
+|---|---|---|
+| POST | `/sessions` `{"teaching_assignment_id","schedule_id"?,"late_after_minutes"?,"lates_per_absence"?}` | TEACHER **responsable** de la asignación |
+| GET | `/sessions/{id}` | profesor de la asignación, tutor del grupo, DIRECTOR |
+| POST | `/sessions/{id}/qr/rotate` | profesor responsable (sesión OPEN) |
+| POST | `/sessions/{id}/check-in` `{"token"}` | STUDENT inscrito en la asignación, desde la red institucional |
+| POST | `/sessions/{id}/manual` `{"subject_enrollment_id","status"}` | profesor responsable (sesión OPEN) |
+| PATCH | `/records/{id}` `{"status"}` | profesor responsable |
+| POST | `/sessions/{id}/close` | profesor responsable |
+| GET | `/teaching-assignments/{id}` | profesor de la asignación, tutor del grupo, DIRECTOR |
+| GET | `/students/{id}` | STUDENT: solo el propio · TEACHER: solo intentos de sus asignaciones · TUTOR: solo grupos que tutela · DIRECTOR: cualquiera |
+
+```http
+POST /api/attendance/sessions        {"teaching_assignment_id":"…"}
+-> 201 {"id":"…","teaching_assignment_id":"…","schedule_id":null,"session_date":"2026-02-02","status":"OPEN",
+        "opened_by":"…","opened_at":"…","closed_at":null,"late_after_minutes":15,"lates_per_absence":3}
+
+POST /api/attendance/sessions/{id}/qr/rotate
+-> 200 {"attendance_session_id":"…","token":"<43 caracteres base64url>","expires_at":"…"}     (Cache-Control: no-store)
+
+POST /api/attendance/sessions/{id}/check-in   {"token":"<token escaneado>"}
+-> 201 {"id":"…","attendance_session_id":"…","subject_enrollment_id":"…","status":"PRESENT|LATE","method":"QR",
+        "recorded_at":"…","recorded_by":"<alumno autenticado>"}
+
+POST /api/attendance/sessions/{id}/manual   {"subject_enrollment_id":"…","status":"PRESENT|LATE|ABSENT"}   -> 201 (method MANUAL)
+PATCH /api/attendance/records/{id}          {"status":"PRESENT|LATE|ABSENT"}                              -> 200
+POST /api/attendance/sessions/{id}/close    -> 200 {"session":{…,"status":"CLOSED"},"absences_created":3}
+
+GET /api/attendance/sessions/{id}
+-> 200 {"session":{…},"counts":{"present":1,"late":0,"absent":0,"justified":0},"pending":1,
+        "students":[{"subject_enrollment_id":"…","student":{…},"record":{…} | null}]}
+
+GET /api/attendance/teaching-assignments/{id}
+-> 200 {"teaching_assignment_id":"…","total_sessions":3,"sessions":[{…,"counts":{…}}],
+        "students":[{"subject_enrollment_id":"…","student":{…},"status":"ACTIVE",
+                     "attendance":{"present":1,"late":3,"absent":0,"justified":0,
+                                   "lates_per_absence":3,"absences_from_lates":1,"effective_absences":1}}]}
+
+GET /api/attendance/students/{id}
+-> 200 {"student_id":"…","data":[{"subject_enrollment_id":"…","teaching_assignment_id":"…","attempt_number":1,
+        "academic_term":{…},"group_code":"2A","subject":{…},"attendance":{…como arriba…},
+        "records":[{"id":"…","attendance_session_id":"…","session_date":"2026-02-02","status":"LATE","method":"QR","recorded_at":"…"}]}]}
+```
+Errores: 400 `invalid_body` · 401 · 403 `forbidden`, `network_not_allowed`, `not_enrolled`, `invalid_qr_token`, `qr_expired` · 404 `attendance_session_not_found`, `attendance_record_not_found`, `teaching_assignment_not_found`, `student_not_found` · 409 `session_already_open`, `session_closed`, `attendance_already_registered`, `term_closed`, `subject_enrollment_inactive`, `record_justified` · 422 `qr_token_required`, `status_not_allowed`, `invalid_late_after_minutes`, `invalid_lates_per_absence`, `subject_enrollment_not_found`, `schedule_not_in_assignment`, `teaching_assignment_not_found`.
+
+**Flujo QR.** (1) El profesor abre la sesión (`POST /sessions`). (2) La pantalla del profesor llama a `qr/rotate` cada ≈`QR_TOKEN_TTL` (30 s por defecto) y dibuja un QR con `{session_id, token}` (el backend no genera imágenes). (3) El alumno escanea y envía `{token}`. Cada rotación **invalida el token anterior**; el token es de 256 bits (`crypto/rand`), se devuelve una sola vez y en la base solo se guarda su SHA-256 (`qr_token_hash`) con `qr_expires_at`; un token vencido o rotado no registra nada, así que una captura de pantalla vieja deja de servir. El token vale para todos los alumnos mientras esté vigente (es el QR proyectado en clase). Cerrar la sesión borra el QR. Las rotaciones no se auditan una por una (sería ruido cada 30 s); el token nunca se guarda en auditoría ni en logs.
+
+**Validación de red (solo para el check-in por QR).** La dirección sale de `netx.ClientIP`: la conexión TCP real, o la cadena `X-Forwarded-For` **únicamente** si el peer está en `TRUSTED_PROXIES` (se recorre de derecha a izquierda, así que entradas antepuestas por el cliente no cuentan). Nunca se lee del cuerpo, de parámetros ni de otros encabezados. Debe pertenecer a `ALLOWED_NETWORKS` (CIDR/IP, sin valores por defecto). Reglas de seguridad:
+- Sin `ALLOWED_NETWORKS` **no se acepta ningún check-in** (jamás significa "cualquier red"); ni siquiera `10.x`/`192.168.x` cuentan por sí solos como prueba de presencia.
+- `APP_ENV=production` **no arranca** sin `ALLOWED_NETWORKS`, con `0.0.0.0/0` o `::/0`, ni con `ATTENDANCE_ALLOW_ANY_NETWORK=true`.
+- `ATTENDANCE_ALLOW_ANY_NETWORK=true` existe solo para desarrollo/pruebas; en producción se ignora aunque llegara a la configuración.
+- Si el backend está en Internet, los alumnos de la universidad suelen compartir una **IP pública de salida (NAT)**: configura esa dirección real (consúltala con redes). Si hay proxy inverso, ponlo en `TRUSTED_PROXIES`; si no, todos los clientes parecerán venir del proxy.
+- La red es una señal adicional, **no prueba absoluta de presencia física** (cualquiera dentro de la red con el QR puede registrarse). No se implementa ningún "ping" del navegador. La captura manual del profesor no depende de la red ni del QR.
+- Variables: `ALLOWED_NETWORKS`, `TRUSTED_PROXIES`, `QR_TOKEN_TTL` (5 s–5 m), `ATTENDANCE_ALLOW_ANY_NETWORK`, `ATTENDANCE_LATE_AFTER_MINUTES` (15), `ATTENDANCE_LATES_PER_ABSENCE` (3), `INSTITUTION_TIMEZONE` (`America/Mexico_City`). El ejemplo de `.env.example` usa `192.0.2.0/24`, un rango de documentación **ficticio**.
+
+**Reglas de asistencia**
+- Una sesión pertenece a una asignación docente y está `OPEN` o `CLOSED`. Solo puede haber **una sesión OPEN por asignación** (índice único parcial en PostgreSQL, migración `0009`); tras cerrarla se puede abrir otra. `session_date` es la fecha local en `INSTITUTION_TIMEZONE`.
+- **Puntualidad (criterio elegido: la apertura de la sesión, no el horario programado, que es opcional).** Check-in antes de `opened_at + late_after_minutes` → `PRESENT`; desde ese instante exacto → `LATE`. Se calcula con la hora del **servidor**; el cliente no envía hora. Ambos parámetros (15 y 3 por defecto) se copian a la sesión y el profesor puede cambiarlos al abrirla (1–1440 min; 1–100 retardos).
+- **3 retardos = 1 falta es un indicador, no una reescritura:** los registros `LATE` nunca se convierten en `ABSENT`. La API devuelve `absences_from_lates = late / lates_per_absence` (división entera) y `effective_absences = absent + absences_from_lates`; `JUSTIFIED` no cuenta. Se usa el `lates_per_absence` de la sesión más reciente.
+- Un registro por alumno y sesión (`UNIQUE` en PostgreSQL): el segundo intento, simultáneo o no, da 409 sin tocar el primero. El alumno debe tener inscripción a materia `ACTIVE` en la asignación.
+- **Captura manual:** el profesor responsable fija `PRESENT`, `LATE` o `ABSENT` (método `MANUAL`) con la sesión OPEN; **`JUSTIFIED` nunca** se acepta (corresponde al flujo de Justifications). NFC está previsto en el esquema como método, pero **no está implementado**.
+- **Corrección (política conservadora, no definida formalmente):** solo el profesor responsable, con el periodo abierto, sobre sesiones abiertas **o cerradas**, entre `PRESENT/LATE/ABSENT`; un registro `JUSTIFIED` no se puede tocar (409). El registro conserva `method` y `recorded_by` originales; el cambio queda en `audit_logs` (`from`, `to`, estado de la sesión). Un valor igual es un no-op.
+- **Cierre:** en una transacción, con la sesión bloqueada en exclusiva (ningún check-in se intercala), se crean registros `ABSENT` (método `MANUAL`, `recorded_by` = quien cierra) para cada inscripción a materia `ACTIVE` sin registro, se borra el QR y la sesión queda `CLOSED`. Es idempotente (nunca toca registros existentes) y un segundo cierre responde 409. Se generan las ausencias porque Justifications necesita un registro `ABSENT` al que referirse.
+- Con el periodo `closed` ninguna escritura de asistencia es posible (409 `term_closed`); la consulta sigue disponible.
+- Auditoría (misma transacción, solo ids): `attendance.session_started`, `attendance.recorded` (QR y manual), `attendance.corrected`, `attendance.session_closed`.
+- Concurrencia: check-in y captura toman la sesión `FOR SHARE`; rotación y cierre `FOR UPDATE`; el periodo se bloquea `FOR SHARE`. Un check-in y un cierre simultáneos terminan con un solo registro coherente por alumno.
+- Consultas sin N+1: detalle de sesión 2 consultas, resumen de asignación 2, historial de alumno 1.
+
+**Migración `0009`**: índice único parcial (una sesión `OPEN` por asignación) y dos `CHECK` de coherencia del QR (hash y vencimiento van juntos; una sesión cerrada no guarda QR). Probada en BD vacía y como upgrade con sesiones y registros previos. Si una base ya tuviera dos sesiones `OPEN` de la misma asignación, la migración falla (no corrige datos en silencio); hoy no existen porque Attendance es nuevo.
+
+**Decisiones abiertas de Attendance**
+- Referencia de puntualidad: apertura de la sesión (elegida) vs hora de inicio del horario.
+- Ventana de tiempo para corregir sesiones cerradas (hoy sin límite mientras el periodo esté abierto).
+- Una sola sesión OPEN por asignación: propuesta; confirmar si hay clases de varios bloques que requieran más.
+- Zona horaria de la institución (`America/Mexico_City` por defecto: supuesto) y rangos reales de red/NAT de la universidad.
+- ABSENT generado al cerrar usa `method = MANUAL` (el esquema exige un método); alternativa: columna de origen en una migración futura.
+- El token QR es válido para todos los alumnos durante su vigencia; si se quisiera de un solo uso por alumno habría que cambiar el diseño.
+- No hay endpoint de listado de sesiones por fecha/profesor ni de reinscripción de un registro `JUSTIFIED`; llegarán con Justifications.
+
 Errores: `{"error":{"code","message","request_id"}}` — 400 cuerpo inválido, 422 validación, 401, 403, 404, 409, 429 (con `Retry-After`), 500.
 
 ## Estructura
 ```
-cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,audit}   migrations/
+cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,audit}   migrations/
 ```
 Cada módulo: `domain / application / ports / adapters`.
 
