@@ -11,12 +11,14 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"runtime/debug"
 	"strconv"
 	"time"
 
 	"github.com/edutrak/backend/internal/platform/apperr"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const maxBodyBytes = 1 << 20 // 1 MiB for JSON bodies
@@ -40,10 +42,22 @@ func JSON(w http.ResponseWriter, status int, v any) {
 }
 
 // DecodeJSON parses a single JSON object, rejecting unknown fields and oversized bodies.
+//
+// A Content-Type other than application/json is refused with 415 (a missing one is treated as
+// JSON, like the rest of the API) and a body above the limit with 413, not a generic 400.
 func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/json" {
+			return apperr.New(apperr.KindUnsupportedMedia, "unsupported_media_type", "Content-Type must be application/json")
+		}
+	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return apperr.New(apperr.KindPayloadTooLarge, "payload_too_large", "request body too large")
+		}
 		return apperr.New(apperr.KindValidation, "invalid_body", "request body is not valid JSON")
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
@@ -92,7 +106,7 @@ func Error(w http.ResponseWriter, r *http.Request, err error) {
 		if errors.As(err, &tooLarge) {
 			status, payload = http.StatusRequestEntityTooLarge, errorPayload{Code: "payload_too_large", Message: "request body too large"}
 		} else {
-			LoggerFrom(r.Context()).Error("unexpected error", "error", err)
+			LoggerFrom(r.Context()).Error("unexpected error", "error", SafeErrorText(err))
 		}
 	}
 	payload.RequestID = RequestIDFrom(r.Context())
@@ -124,6 +138,9 @@ type statusRecorder struct {
 	status int
 }
 
+// Unwrap lets http.NewResponseController reach the real connection (deadlines, flushing).
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
@@ -154,4 +171,25 @@ func Base(log *slog.Logger, h http.Handler) http.Handler {
 		}()
 		h.ServeHTTP(rec, r)
 	})
+}
+
+// ExtendDeadlines gives ONE request more time to read its body and to write its answer than the
+// server-wide ReadTimeout/WriteTimeout, which stay short for every other route. It is meant for
+// file uploads over slow links. It does nothing when the connection does not support deadlines.
+func ExtendDeadlines(w http.ResponseWriter, read, write time.Duration) {
+	rc := http.NewResponseController(w)
+	now := time.Now()
+	_ = rc.SetReadDeadline(now.Add(read))
+	_ = rc.SetWriteDeadline(now.Add(write))
+}
+
+// SafeErrorText is what may be logged for an unexpected error. A PostgreSQL constraint error
+// carries the failing row in its detail (which could hold a tutoring note or a file name), so only
+// its SQLSTATE, table and constraint are kept; any other error is logged as is.
+func SafeErrorText(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return "postgres error: sqlstate=" + pgErr.Code + " table=" + pgErr.TableName + " constraint=" + pgErr.ConstraintName
+	}
+	return err.Error()
 }

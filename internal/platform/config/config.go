@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	_ "time/tzdata" // the institution timezone must load on hosts without a zoneinfo database
+
+	"github.com/edutrak/backend/internal/platform/httpx"
 )
 
 type Config struct {
@@ -28,8 +30,11 @@ type Config struct {
 	AllowedNetworks []netip.Prefix
 	// TrustedProxies are the only peers whose X-Forwarded-For header is honoured.
 	TrustedProxies []netip.Prefix
-	StorageDir     string
-	MaxEvidenceMB  int
+	// CORSAllowedOrigins are the only browser origins allowed to call the API cross-origin
+	// (exact scheme://host[:port]). Empty = no CORS headers at all. "*" is never accepted.
+	CORSAllowedOrigins []string
+	StorageDir         string
+	MaxEvidenceMB      int
 	// JustificationEvidenceRequired makes at least one evidence file mandatory for a request.
 	// The institution has not confirmed it, so it is off by default.
 	JustificationEvidenceRequired bool
@@ -104,6 +109,16 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		cfg.JWTSecret = []byte(secret)
 	}
+	for _, o := range strings.Split(getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if o = strings.TrimSpace(o); o == "" {
+			continue
+		}
+		if err := httpx.ValidateOrigin(o); err != nil {
+			errs = append(errs, fmt.Errorf("CORS_ALLOWED_ORIGINS: %q: %w", o, err))
+			continue
+		}
+		cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
+	}
 	if port, err := strconv.Atoi(cfg.HTTPPort); err != nil || port < 1 || port > 65535 {
 		errs = append(errs, errors.New("HTTP_PORT must be a valid port"))
 	}
@@ -163,6 +178,18 @@ func Load(getenv func(string) string) (Config, error) {
 		if len(cfg.AllowedNetworks) == 0 {
 			errs = append(errs, errors.New("ALLOWED_NETWORKS is required when APP_ENV=production"))
 		}
+		// Example values copied from .env.example / docker-compose must never reach production.
+		if isPlaceholderSecret(string(cfg.JWTSecret)) {
+			errs = append(errs, errors.New("JWT_SECRET looks like a documentation placeholder; generate a real one (openssl rand -base64 48)"))
+		}
+		if strings.Contains(cfg.DatabaseURL, "edutrak_dev_password") || strings.Contains(cfg.DatabaseURL, "edutrak_ci_password") {
+			errs = append(errs, errors.New("DATABASE_URL uses the development/CI example password; use a real credential in production"))
+		}
+		for _, o := range cfg.CORSAllowedOrigins {
+			if strings.HasPrefix(o, "http://") && !strings.HasPrefix(o, "http://localhost") && !strings.HasPrefix(o, "http://127.0.0.1") {
+				errs = append(errs, fmt.Errorf("CORS_ALLOWED_ORIGINS: %s is plain http; use https in production", o))
+			}
+		}
 		// Evidence must live outside the web root: require an explicit absolute directory.
 		if getenv("STORAGE_DIR") == "" || !filepath.IsAbs(cfg.StorageDir) {
 			errs = append(errs, errors.New("STORAGE_DIR must be set to an absolute private directory when APP_ENV=production"))
@@ -178,6 +205,16 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))
 	}
 	return cfg, nil
+}
+
+// isPlaceholderSecret detects the documentation values shipped in .env.example.
+func isPlaceholderSecret(s string) bool {
+	l := strings.ToLower(s)
+	if l == "" {
+		return false
+	}
+	return strings.Contains(l, "change-me") || strings.Contains(l, "changeme") || strings.Contains(l, "example") ||
+		strings.Count(l, string(l[0])) == len(l) // a single repeated character
 }
 
 // ParsePrefixes parses a comma-separated list of CIDRs or single IPs.
