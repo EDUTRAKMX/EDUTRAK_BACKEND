@@ -11,6 +11,10 @@ import (
 	acadhttp "github.com/edutrak/backend/internal/academic/adapters/http"
 	acadpg "github.com/edutrak/backend/internal/academic/adapters/postgres"
 	acadapp "github.com/edutrak/backend/internal/academic/application"
+	analyticshttp "github.com/edutrak/backend/internal/analytics/adapters/http"
+	analyticspg "github.com/edutrak/backend/internal/analytics/adapters/postgres"
+	analyticsapp "github.com/edutrak/backend/internal/analytics/application"
+	analyticsdomain "github.com/edutrak/backend/internal/analytics/domain"
 	attendancehttp "github.com/edutrak/backend/internal/attendance/adapters/http"
 	attendancenet "github.com/edutrak/backend/internal/attendance/adapters/network"
 	attendancepg "github.com/edutrak/backend/internal/attendance/adapters/postgres"
@@ -157,6 +161,22 @@ func NewTutoringService(db *database.DB, cfg config.Config) *tutoringapp.Service
 	})
 }
 
+// NewAnalyticsService builds the analytics use cases. Indicators are derived from the other
+// modules' tables on every read; the only table Analytics writes is alerts.
+func NewAnalyticsService(db *database.DB, cfg config.Config) *analyticsapp.Service {
+	return analyticsapp.NewService(analyticsapp.Deps{
+		Facts:  analyticspg.NewFacts(db),
+		Alerts: analyticspg.NewAlerts(db),
+		Audit:  auditpg.NewRecorder(db),
+		Tx:     db,
+		Clock:  systemClock{},
+		NewID:  uuid.New,
+		Rules: analyticsdomain.Rules{
+			AbsencesThreshold: cfg.AnalyticsAbsencesThreshold, TrendWindow: cfg.AnalyticsTrendWindow, TrendDropPoints: cfg.AnalyticsTrendDropPoints,
+		},
+	})
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -187,5 +207,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	justhttp.NewHandler(justifications, identity, maxEvidenceBytes(cfg)).Register(mux)
 	attendancehttp.NewHandler(NewAttendanceService(db, cfg), identity, cfg.TrustedProxies).Register(mux)
 	tutoringhttp.NewHandler(NewTutoringService(db, cfg), identity).Register(mux)
+	analyticshttp.NewHandler(NewAnalyticsService(db, cfg), identity).Register(mux)
 	return httpx.Base(log, mux), nil
 }

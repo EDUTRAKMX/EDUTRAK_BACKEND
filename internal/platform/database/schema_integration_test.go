@@ -830,3 +830,54 @@ func TestMigration0011AddsTutoringContextWithoutLosingData(t *testing.T) {
 		t.Fatal("the history is append-only: DELETE must fail")
 	}
 }
+
+func TestMigration0012MakesAlertsReliableWithoutLosingData(t *testing.T) {
+	db := dbtest.NewEmpty(t)
+	ctx := context.Background()
+	old := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_identity.sql", "0002_academic.sql", "0003_grades_attendance.sql", "0004_justifications_tutoring_analytics_audit.sql",
+		"0005_dictionary_alignment_and_session_revocation.sql", "0006_level_columns.sql", "0007_academic_dictionary_alignment.sql",
+		"0008_grades_dictionary_alignment.sql", "0009_attendance_integrity.sql", "0010_justifications_integrity.sql", "0011_tutoring_context.sql",
+	} {
+		body, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old[name] = &fstest.MapFile{Data: body}
+	}
+	if err := db.Migrate(ctx, old, discardLogger()); err != nil {
+		t.Fatalf("migrate to 0011: %v", err)
+	}
+	student := insertUser(t, db, "40000049")
+	legacy := uuid.New()
+	mustExec(t, db, `INSERT INTO alerts (id, student_id, type, message, evidence, status) VALUES ($1, $2, 'ATTENDANCE_DROP', 'previa', '{"previous_pct":100}', 'OPEN')`, legacy, student)
+
+	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
+		t.Fatalf("upgrade to latest: %v", err)
+	}
+	var msg, status string
+	var group *uuid.UUID
+	if err := db.Q(ctx).QueryRow(ctx, `SELECT message, status, group_id FROM alerts WHERE id = $1`, legacy).Scan(&msg, &status, &group); err != nil {
+		t.Fatal(err)
+	}
+	if msg != "previa" || status != "OPEN" || group != nil {
+		t.Fatalf("legacy alert changed: %q %q %v", msg, status, group)
+	}
+	ins := `INSERT INTO alerts (id, student_id, type, message, condition_key, status, resolved_at) VALUES ($1, $2, $3, 'm', $4, $5, $6)`
+	if err := execErr(db, ins, uuid.New(), student, "ATTENDANCE_DROP", "drop:x", "OPEN", nil); err != nil {
+		t.Fatalf("valid alert rejected: %v", err)
+	}
+	if err := execErr(db, ins, uuid.New(), student, "ATTENDANCE_DROP", "drop:x", "OPEN", nil); err == nil {
+		t.Fatal("a second unresolved alert for the same condition must be rejected")
+	}
+	if err := execErr(db, ins, uuid.New(), student, "ATTENDANCE_DROP", "drop:x", "RESOLVED", time.Now()); err != nil {
+		t.Fatalf("resolved history must be allowed: %v", err)
+	}
+	if err := execErr(db, ins, uuid.New(), student, "NOT_A_RULE", "k", "OPEN", nil); err == nil {
+		t.Fatal("unknown rule accepted")
+	}
+	if err := execErr(db, ins, uuid.New(), student, "ATTENDANCE_DROP", "k2", "RESOLVED", nil); err == nil {
+		t.Fatal("RESOLVED without resolved_at accepted")
+	}
+}
