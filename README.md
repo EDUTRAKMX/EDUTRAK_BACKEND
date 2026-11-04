@@ -15,7 +15,7 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
 | Justifications (solicitud con evidencias privadas, revisión Tutor → Profesor, JUSTIFIED atómico en Attendance, consultas) | Implementado (`/api/justifications/*`) |
 | Tutoring (alumnos del tutor, resumen académico, seguimientos append-only, historial) | Implementado (`/api/tutoring/*`); sin pendientes/estados (el esquema no los tiene) |
-| Analytics | **No implementado** (solo tablas) |
+| Analytics (indicadores por alumno/grupo, resumen del director, alertas explicables con recálculo idempotente) | Implementado (`/api/analytics/*`); sin predicción ni puntaje de riesgo |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
@@ -382,11 +382,84 @@ Errores: 400 `invalid_body` (JSON mal formado o campos desconocidos) · 401 · 4
 - Si un periodo cerrado debe bloquear también los seguimientos (hoy sí, por coherencia con el resto).
 - Si el seguimiento aplica a alumnos con inscripción `WITHDRAWN` (hoy no se pueden añadir; el historial se conserva).
 
+### Analytics (`/api/analytics`)
+Indicadores académicos verificables y alertas explicables para el Tutor y el Director. **Todo se deriva de las tablas de los otros módulos en cada lectura** (nada se duplica ni se guarda como snapshot); lo único que Analytics escribe es la tabla `alerts`. No hay predicción, puntaje de riesgo, clasificación de alumnos ni análisis del texto de los seguimientos.
+
+Autorización (rol + relación vigente, releída en cada llamada): **TUTOR** solo grupos con `groups.tutor_id` = él ahora (si el grupo cambia de tutor, el anterior pierde el acceso al instante y el nuevo hereda alertas e historial); **DIRECTOR** todos los grupos (el modelo no relaciona director con carrera, no se inventó esa relación). ADMIN, TEACHER y STUDENT reciben 403 en todo: las alertas están reservadas a Tutor y Director y no hay vista del alumno ni del profesor en el MVP.
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/students/{id}?group_id=` | indicadores de UN alumno en UN grupo/periodo (sin `group_id`: la inscripción más reciente a la que el llamante tiene acceso) |
+| GET | `/groups/{id}` | indicadores agregados de los alumnos ACTIVOS del grupo |
+| GET | `/overview?academic_term_id=&career_id=` | una línea agregada por grupo (SQL), TUTOR: sus grupos · DIRECTOR: todos |
+| GET | `/alerts?student_id=&group_id=&academic_term_id=&type=&status=&limit=&offset=` | alertas **persistidas** dentro del alcance; **solo se actualizan bajo demanda** con `POST /alerts/recalculate` (un GET nunca recalcula y puede estar desactualizado: ver `evaluated_at`). `status`: vacío = sin resolver (OPEN+ACKNOWLEDGED), `OPEN`, `ACKNOWLEDGED`, `RESOLVED`, `ALL` |
+| GET | `/alerts/{id}` | una alerta persistida (tan fresca como el último recálculo bajo demanda; ver `evaluated_at`) |
+| POST | `/alerts/recalculate` `{"group_id":"…","student_id":"…"?}` | evalúa **bajo demanda** las reglas de UN grupo (o de un alumno suyo) y actualiza las alertas persistidas; tutor del grupo o DIRECTOR |
+
+```http
+GET /api/analytics/students/{id}?group_id=…
+-> 200 {"group":{"id","code","level"},"career":{…},"academic_term":{"id","name","status","start_date","end_date"},
+        "student":{"id","institutional_number","first_name","last_name"},"enrollment_status":"ACTIVE",
+        "subjects":[{"subject_enrollment_id","teaching_assignment_id","subject":{"code","name"},"attempt_number","status",
+          "grades":{"units_total":7,"units_graded":2,"units_pending":5,"na":1,"sa":0,"de":1,"au":0,
+                    "na_units":[{"subject_unit_id","unit_number","unit_name","score":76.00,"category":"NA"}]},
+          "attendance":{"closed_session_records":11,"present":9,"late":1,"absent":1,"justified":0,"unjustified_absences":1,
+                        "attendance_pct":90.91,"lates_per_absence":3,"absences_from_lates":0,"effective_absences":1},
+          "attendance_trend":{"window_sessions":5,"recent":{…,"attendance_pct":80.00},"previous":{…,"attendance_pct":100.00},"drop_points":20.00}|null,
+          "justifications":{"requests_total","pending_tutor","pending_teacher","tutor_rejected","teacher_rejected","approved",
+                            "absences_with_request","oldest_pending_request_date"}}],
+        "totals":{"grades":{…},"attendance":{…},"justifications":{…}},
+        "tutoring":{"followups_count":2,"last_followup_date":"2026-03-01"},
+        "signals":[{"rule","rule_description","message","evidence":{…}}],     // calculadas EN VIVO
+        "alerts":[<alerta persistida>…]}                                       // tal como quedaron en el último recálculo
+
+GET /api/analytics/alerts -> 200 {"data":[{"id","rule","rule_description","status","message","evidence":{…},
+        "student":{…},"group":{"id","code"},"academic_term":{"id","name"},"subject":{"subject_enrollment_id","code","name"}|null,
+        "created_at","updated_at","evaluated_at","resolved_at"}],"total","limit","offset"}
+
+POST /api/analytics/alerts/recalculate -> 200 {"group_id","student_id","evaluated_at","created","updated","resolved","unchanged","open_alerts":{"GRADE_NA_UNIT":1,…}}
+```
+`/groups/{id}` devuelve además `active_students`, `grades`, `attendance`, `justifications`, `tutoring{students_with_followup, students_without_followup, followups_count}`, `signals_now` (señales vivas por regla), `open_alerts` (persistidas por regla), `by_assignment[]` (una entrada por asignación docente; nunca se mezclan entre sí) y `students[]` (fila compacta por alumno).
+
+**Métricas — fórmulas exactas**
+- *Registros considerados* (`closed_session_records`) = registros de asistencia de sesiones **CERRADAS** (`attendance_sessions.status = 'CLOSED'`) de las inscripciones a materia. Las sesiones abiertas se excluyen: antes del cierre, la falta de un registro no significa ausencia.
+- `present`, `late`, `absent`, `justified` = conteo por estado. `unjustified_absences` = `absent` (las faltas `JUSTIFIED` son otro estado; una solicitud pendiente **no** justifica nada).
+- `attendance_pct` (**asistencia ajustada por justificaciones**) = **(present + late) / (present + late + absent)**. Numerador: asistencias puntuales y retardos. Denominador: todos los registros cerrados **excepto los `JUSTIFIED`**, que se excluyen (una falta justificada no cuenta como asistencia ni penaliza). Por eso NO es "asistencias / sesiones totales": con registros `JUSTIFIED` el porcentaje es mayor que esa razón simple, y se puede recuperar el cálculo sin ajuste con los conteos (`present`, `late`, `absent`, `justified`). Redondeo a centésimas con enteros. Sin denominador → `null` (nunca 0 %). Los porcentajes de grupo se calculan sumando numeradores y denominadores, no promediando porcentajes.
+- `absences_from_lates` = ⌊late / `lates_per_absence`⌋ y `effective_absences` = `absent` + `absences_from_lates`: es **exactamente** la regla de Attendance (reutilizada, no reimplementada); indicador, los retardos nunca se reescriben como faltas, `JUSTIFIED` no suma. `lates_per_absence` sale de la sesión abierta más recientemente de la asignación (`null` sin sesiones: no se deriva nada). En totales, la equivalencia se aplica por materia y luego se suma (no se mezclan retardos entre materias).
+- *Tendencia*: con `N` = `ANALYTICS_TREND_WINDOW`, compara el `attendance_pct` de los últimos `N` registros cerrados contra los `N` anteriores. Solo existe con al menos `2N` registros y con denominador en ambas ventanas; si no, `attendance_trend` es `null`. `drop_points` = anterior − reciente.
+- *Calificaciones*: `units_total` = unidades de la materia; `units_graded` = unidades con calificación capturada; `units_pending` = el resto (**no son NA ni 0.00**). NA < 80.00 · SA 80.00–89.99 · DE 90.00–99.99 · AU = 100.00, con centésimos enteros (reglas de Grades). No hay promedios ni calificación final (sin política institucional). Cada intento (`attempt_number`) y cada periodo se calcula por separado.
+- *Justificantes*: se cuentan **solicitudes** y **ausencias** por separado (`absences_with_request` = registros de asistencia distintos con al menos una solicitud: varias solicitudes rechazadas de la misma falta son varias solicitudes, una falta). `PENDING_*` no es una justificación definitiva; la fuente de verdad de una falta justificada es el estado `JUSTIFIED` en Attendance.
+- *Tutoring*: solo `followups_count` y `last_followup_date`; nunca el texto. "Sin seguimiento" es un dato, no una valoración del tutor.
+
+**Alertas** (tabla `alerts`, `type` = código de regla; los umbrales son **configuraciones propuestas para el MVP (valores por defecto elegidos por el equipo técnico), NO reglas oficiales de la universidad**, ajustables por entorno sin tocar otros módulos):
+
+| Regla | Condición | Clave de condición | Umbral |
+|---|---|---|---|
+| `GRADE_NA_UNIT` | una unidad capturada con score < 80.00 | `unit:<inscripción>:<unidad>` | — |
+| `UNJUSTIFIED_ABSENCES` | `absent` ≥ umbral en una materia (sesiones cerradas) | `absences:<inscripción>` | `ANALYTICS_ABSENCES_THRESHOLD` = 3 |
+| `ATTENDANCE_DROP` | `attendance_pct` previo − reciente ≥ puntos, con ≥ 2N registros | `drop:<inscripción>` | `ANALYTICS_TREND_WINDOW` = 5, `ANALYTICS_TREND_DROP_POINTS` = 20 |
+| `PENDING_JUSTIFICATIONS` | solicitudes `PENDING_TUTOR`/`PENDING_TEACHER` del alumno en el grupo | `pending:<grupo>` | — |
+
+Cada alerta guarda `message` (en español, con los datos reales), `evidence` (JSON: grupo, periodo, materia, intento, cifras y umbral aplicado), la regla, el contexto (`group_id`, y `subject_enrollment_id` cuando aplica) y cuándo se evaluó. No afirman que el alumno reprobará ni diagnostican; la ausencia de seguimientos no genera ninguna alerta.
+
+**Recálculo y vigencia.** Leer **nunca** recalcula (los GET no escriben). `POST /alerts/recalculate` evalúa UN grupo (opcionalmente un alumno) en una transacción: crea las condiciones nuevas (`OPEN`), conserva las vigentes (una `ACKNOWLEDGED` sigue así; si el mensaje o la evidencia cambiaron se actualizan en la misma fila) y pasa a `RESOLVED` (con `resolved_at`) las que dejaron de cumplirse, p. ej. al corregir una nota NA a SA, justificar una falta o resolver una solicitud. Si la condición vuelve, se abre una alerta **nueva** y la resuelta queda como historial. Es idempotente: la identidad de una alerta es `(alumno, regla, clave de condición)`, con un índice único parcial sobre las no resueltas y un candado consultivo por grupo que serializa evaluaciones concurrentes. Solo aplica a inscripciones ACTIVAS; un periodo cerrado se congela (409 `term_closed`). Se escribe **un** evento de auditoría por ejecución que cambió algo (`analytics.alerts_recalculated` con ids y conteos, nunca contenido); una ejecución sin cambios no audita ni crea filas (solo avanza `evaluated_at`). **Ventana de consistencia:** las alertas guardadas reflejan el último recálculo; no hay recálculo automático ni programador (nada dispara el recálculo al capturar una nota, cerrar una sesión o resolver una solicitud). Las `signals` de `/students/{id}` y `signals_now` de `/groups/{id}` se calculan en vivo con los mismos datos y reglas, útiles para detectar alertas desactualizadas. Un cambio de alumno de grupo o de tutor se refleja al recalcular el grupo afectado.
+
+Errores: 400 `invalid_body` · 401 · 403 `forbidden` · 404 `student_not_found`, `group_not_found`, `enrollment_not_found`, `alert_not_found` · 409 `term_closed` · 422 `invalid_filter`, `invalid_paging` (`limit` 1–200), `group_id_required`, `invalid_group_id`, `invalid_student_id`.
+
+**Migración `0012`** (la tabla `alerts` de 0004 no tenía contexto académico, forma de identificar una condición ni fechas): añade `group_id`, `condition_key`, `updated_at`, `evaluated_at`, `resolved_at`, `CHECK` de coherencia `RESOLVED ⇔ resolved_at` y de tipos de regla conocidos, el índice único parcial `alerts_one_open_per_condition_idx` y un índice `(group_id, status)`. Probada en BD vacía y como upgrade con una alerta previa.
+
+**Limitaciones y decisiones abiertas de Analytics**
+- Los umbrales (3 faltas, ventanas de 5, 20 puntos) son propuestas; falta que la institución defina umbrales oficiales, plazos de justificación y criterios de seguimiento mínimo.
+- No hay `acknowledge` de alertas (el estado `ACKNOWLEDGED` existe en el esquema y se respeta, pero ningún endpoint lo asigna), ni recálculo automático, ni notificaciones.
+- El DIRECTOR no está acotado por carrera (el modelo no lo relaciona). TEACHER y STUDENT no tienen vista de Analytics.
+- Pendientes de Tutoring (acuerdos, próxima revisión, estado) no existen como datos, así que no hay métricas de ellos.
+- Los GET de grupo cargan los hechos del grupo (6 consultas constantes, acotadas por grupo); `/overview` usa agregados SQL por grupo. Si un grupo creciera mucho habría que medir antes de añadir vistas materializadas.
+
 Errores: `{"error":{"code","message","request_id"}}` — 400 cuerpo inválido, 422 validación, 401, 403, 404, 409, 429 (con `Retry-After`), 500.
 
 ## Estructura
 ```
-cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,justifications,tutoring,audit}   migrations/
+cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,justifications,tutoring,analytics,audit}   migrations/
 ```
 Cada módulo: `domain / application / ports / adapters`.
 
