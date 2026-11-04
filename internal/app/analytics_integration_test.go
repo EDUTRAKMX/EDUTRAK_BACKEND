@@ -3,6 +3,7 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -321,6 +322,52 @@ func TestAnalyticsGroupAndOverviewAgree(t *testing.T) {
 	w.expect("director", "GET", ax+"/overview?academic_term_id=zz", "", 422, "invalid_filter")
 }
 
+// checkRecalcAuditMetadata verifies that the audit metadata of a recalculation carries exactly the
+// group id and the three counters, so no grade, message or evidence can be hiding in it.
+func checkRecalcAuditMetadata(raw, group string) error {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return err
+	}
+	for k, v := range m {
+		switch k {
+		case "group_id":
+			if v != group {
+				return fmt.Errorf("group_id = %v", v)
+			}
+		case "created", "updated", "resolved":
+			if _, ok := v.(float64); !ok {
+				return fmt.Errorf("%s is not a counter: %v", k, v)
+			}
+		default:
+			return fmt.Errorf("unexpected key %q", k)
+		}
+	}
+	if len(m) != 4 {
+		return fmt.Errorf("expected group_id and 3 counters, got %d keys", len(m))
+	}
+	return nil
+}
+
+// Deterministic regression: digits such as 76 inside an id are fine; a score key is not.
+func TestRecalcAuditMetadataCheckIgnoresDigitsInIds(t *testing.T) {
+	group := "00007600-1176-4076-8076-000000000076"
+	ok := `{"group_id":"` + group + `","created":5,"updated":0,"resolved":0}`
+	if err := checkRecalcAuditMetadata(ok, group); err != nil {
+		t.Fatalf("a UUID containing 76 must not be flagged: %v", err)
+	}
+	for _, bad := range []string{
+		`{"group_id":"` + group + `","created":5,"updated":0,"resolved":0,"score":76}`,
+		`{"group_id":"` + group + `","created":5,"updated":0,"resolved":0,"message":"76.00"}`,
+		`{"group_id":"` + group + `","created":"76","updated":0,"resolved":0}`,
+		`{"group_id":"` + group + `","created":5,"updated":0}`,
+	} {
+		if checkRecalcAuditMetadata(bad, group) == nil {
+			t.Errorf("must be flagged: %s", bad)
+		}
+	}
+}
+
 func TestAnalyticsRecalculationFollowsTheData(t *testing.T) {
 	f := newAFx(t)
 	w := f.w
@@ -344,8 +391,12 @@ func TestAnalyticsRecalculationFollowsTheData(t *testing.T) {
 	if n := w.sqlInt(`SELECT count(*) FROM audit_logs WHERE action = 'analytics.alerts_recalculated'`); n != 1 {
 		t.Fatalf("audit events = %d, want 1 (runs without changes are not audited)", n)
 	}
-	if n := w.sqlInt(`SELECT count(*) FROM audit_logs WHERE action = 'analytics.alerts_recalculated' AND metadata::text LIKE '%76%'`); n != 0 {
-		t.Fatal("scores must not be written to the audit trail")
+	// Privacy contract of the audit event: ids and counts only. This inspects the structure of the
+	// metadata, not a substring: the group id is a random UUID, which contains "76" by chance in
+	// about 1 run in 10 (that made the former LIKE '%76%' check fail intermittently).
+	meta := w.sqlString(`SELECT metadata::text FROM audit_logs WHERE action = 'analytics.alerts_recalculated'`)
+	if err := checkRecalcAuditMetadata(meta, f.group); err != nil {
+		t.Fatalf("scores must not be written to the audit trail: %v (metadata %s)", err, meta)
 	}
 
 	// Reading shows each alert with its explanation.
