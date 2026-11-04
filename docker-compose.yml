@@ -1,4 +1,11 @@
-# Local development databases only (fictitious credentials).
+# EDUTRAK -- local development and test infrastructure ONLY (fictitious credentials).
+# Production is NOT deployed from this file: see "Despliegue" in README.md.
+#
+#   docker compose up -d db                 # PostgreSQL for `go run ./cmd/api` on the host
+#   docker compose up -d db-test            # (explicit name; profile "test") throwaway PostgreSQL (tmpfs) for `go test`
+#   docker compose --profile app up --build # full stack in containers: db + migrate + api
+#
+# Ports are bound to 127.0.0.1 so the databases are not reachable from the network.
 services:
   db:
     image: postgres:16-alpine
@@ -7,7 +14,7 @@ services:
       POSTGRES_PASSWORD: edutrak_dev_password
       POSTGRES_DB: edutrak
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - edutrak_pg:/var/lib/postgresql/data
     healthcheck:
@@ -17,15 +24,50 @@ services:
       retries: 10
 
   db-test:
+    profiles: ["test"]
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: edutrak
       POSTGRES_PASSWORD: edutrak_dev_password
       POSTGRES_DB: edutrak_test
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     tmpfs:
       - /var/lib/postgresql/data
 
+  # One-shot: applies the forward-only migrations, then exits.
+  migrate:
+    profiles: ["app"]
+    build: .
+    command: ["migrate"]
+    environment: &appenv
+      APP_ENV: development
+      DATABASE_URL: postgres://edutrak:edutrak_dev_password@db:5432/edutrak?sslmode=disable
+      # Development-only value; the api refuses placeholders when APP_ENV=production.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-dev-only-secret-0123456789}
+      STORAGE_DIR: /var/lib/edutrak/evidence
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+      # Compose networking: QR check-in is allowed from anywhere ONLY because this is development.
+      ATTENDANCE_ALLOW_ANY_NETWORK: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    profiles: ["app"]
+    build: .
+    environment: *appenv
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - edutrak_evidence:/var/lib/edutrak/evidence
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 volumes:
   edutrak_pg:
+  edutrak_evidence:
