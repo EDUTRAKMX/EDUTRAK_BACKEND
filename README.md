@@ -15,30 +15,92 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
 | Justifications (solicitud con evidencias privadas, revisión Tutor → Profesor, JUSTIFIED atómico en Attendance, consultas) | Implementado (`/api/justifications/*`) |
 | Tutoring (alumnos del tutor, resumen académico, seguimientos append-only, historial) | Implementado (`/api/tutoring/*`); sin pendientes/estados (el esquema no los tiene) |
+| Plataforma (CORS por orígenes, cabeceras de seguridad, 404/405 en JSON, health/ready, Dockerfile, compose, CI) | Implementado; el CI **no** se ha ejecutado en GitHub |
+| OpenAPI (`api/openapi.yaml`, 74 operaciones) y guía de integración con el frontend | Implementado y validado por pruebas de contrato |
+| Datos de demostración (`go run ./cmd/seed demo`) | Implementado (solo ficticios; se niega en producción) |
 | Analytics (indicadores por alumno/grupo, resumen del director, alertas explicables con recálculo idempotente) | Implementado (`/api/analytics/*`); sin predicción ni puntaje de riesgo |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
 
-## Setup
-```bash
-cp .env.example .env          # editar JWT_SECRET (>= 32 bytes) y credenciales
-docker compose up -d db db-test
-go run ./cmd/migrate          # aplica migraciones
-go run ./cmd/seed             # crea el primer ADMIN (SEED_ADMIN_NUMBER / SEED_ADMIN_PASSWORD)
-go run ./cmd/api
-```
+## Arquitectura general
+Monolito modular, un solo despliegue (`cmd/api`), PostgreSQL como única dependencia. Cada módulo (`identity`, `academic`, `grades`, `attendance`, `justifications`, `tutoring`, `analytics`, más `audit` solo de escritura) sigue `domain → application → ports ← adapters` (HTTP y PostgreSQL); `internal/app` es el único lugar que conoce las implementaciones concretas y `internal/platform/*` es infraestructura transversal (config, base de datos, HTTP común, red, logging, errores). La autorización (**rol + relación con el recurso**) vive en la capa `application` de cada módulo, nunca en el router, y se relee en cada llamada.
 
-## Variables
-`DATABASE_URL` y `JWT_SECRET` son obligatorias (el arranque falla sin ellas). Opcionales: `HTTP_PORT` (8080), `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `QR_TOKEN_TTL` (30s), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m), `ALLOWED_NETWORKS` (obligatoria en producción), `TRUSTED_PROXIES`, `ATTENDANCE_ALLOW_ANY_NETWORK` (solo dev), `JUSTIFICATION_EVIDENCE_REQUIRED`, `ATTENDANCE_LATE_AFTER_MINUTES`, `ATTENDANCE_LATES_PER_ABSENCE`, `INSTITUTION_TIMEZONE`, `STORAGE_DIR`, `MAX_EVIDENCE_MB`, `APP_ENV`, `LOG_LEVEL`. Ver `.env.example`. Un archivo `.env` se carga si existe sin pisar variables ya definidas.
+Cadena HTTP (de fuera hacia dentro): `Base` (request id, log de acceso, recuperación de pánicos) → `SecurityHeaders` → `CORS` → `JSONFallback` (404/405 en JSON) → rutas (cada una envuelta en `Authenticate`).
+
+## Inicio rápido
+```bash
+cp .env.example .env                      # JWT_SECRET propio (>= 32 bytes); el resto sirve para desarrollo
+docker compose up -d db                   # PostgreSQL de desarrollo en 127.0.0.1:5432
+go run ./cmd/migrate                      # aplica migraciones (hacia adelante; repetirlo no hace nada)
+go run ./cmd/seed                         # primer ADMIN (SEED_ADMIN_NUMBER / SEED_ADMIN_PASSWORD)
+go run ./cmd/seed demo                    # (opcional) datos ficticios de demostración, ver más abajo
+go run ./cmd/api                          # http://localhost:8080  (GET /healthz, GET /readyz)
+```
+Todo en contenedores (base + migraciones + API): `docker compose --profile app up --build` (API en `127.0.0.1:8080`; la clave JWT de desarrollo del compose es **solo para desarrollo**; con `APP_ENV=production` el arranque rechaza claves de ejemplo).
+
+## Variables de entorno
+Obligatorias: `DATABASE_URL`, `JWT_SECRET` (≥ 32 bytes). Todo lo demás tiene valor por defecto o es opcional; la referencia completa y comentada está en `.env.example`.
+
+| Grupo | Variables |
+|---|---|
+| Servidor | `APP_ENV` (`development`\|`production`), `HTTP_PORT` (8080), `LOG_LEVEL` |
+| CORS | `CORS_ALLOWED_ORIGINS`: orígenes exactos separados por coma (`https://app.universidad.edu`); vacío = sin cabeceras CORS; `*` se rechaza; en producción solo `https` (salvo `localhost`) |
+| Sesiones | `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m) |
+| Asistencia | `QR_TOKEN_TTL` (30s, 5s–5m), `ALLOWED_NETWORKS`, `TRUSTED_PROXIES`, `ATTENDANCE_ALLOW_ANY_NETWORK` (solo dev), `ATTENDANCE_LATE_AFTER_MINUTES` (15), `ATTENDANCE_LATES_PER_ABSENCE` (3), `INSTITUTION_TIMEZONE` (`America/Mexico_City`) |
+| Justificantes | `STORAGE_DIR`, `MAX_EVIDENCE_MB` (≤ 10), `JUSTIFICATION_EVIDENCE_REQUIRED` |
+| Analytics | `ANALYTICS_ABSENCES_THRESHOLD` (3), `ANALYTICS_TREND_WINDOW` (5), `ANALYTICS_TREND_DROP_POINTS` (20): **propuestas técnicas del MVP**, no reglas institucionales |
+| Seeds | `SEED_ADMIN_NUMBER`, `SEED_ADMIN_PASSWORD`, `DEMO_PASSWORD` (opcional) |
+| Pruebas | `TEST_DATABASE_URL` |
+
+**`ALLOWED_NETWORKS` (red institucional del QR).** Es una lista de CIDR/IP que *el backend ve* como origen de la petición. Cómo fijarla: (1) pide a Redes la(s) IP(s) **públicas de salida (NAT)** del campus si la API está en Internet, o el rango interno si la API está dentro de la red; (2) si hay un proxy inverso delante, ponlo en `TRUSTED_PROXIES` para que se lea `X-Forwarded-For` solo de él; (3) verifica con un celular en el Wi-Fi del campus y otro con datos móviles. Vacío = **nadie** puede hacer check-in (nunca "cualquier red"); `APP_ENV=production` no arranca sin rangos, con `/0` o con `ATTENDANCE_ALLOW_ANY_NETWORK`. `192.0.2.0/24` del ejemplo es un rango de documentación, no institucional.
+
+## Entornos
+| | Desarrollo | Pruebas | Producción |
+|---|---|---|---|
+| Base | `docker compose up -d db` (`127.0.0.1:5432`, volumen `edutrak_pg`) | `docker compose up -d db-test` (`127.0.0.1:5433`, **tmpfs**: se pierde al apagar) | PostgreSQL administrado/propio; **no** se despliega con este compose |
+| Credenciales | ficticias del compose | ficticias | reales, fuera del repositorio; el arranque rechaza `edutrak_dev_password`/`edutrak_ci_password` y claves JWT de ejemplo |
+| `ATTENDANCE_ALLOW_ANY_NETWORK` | permitido | permitido | prohibido (no arranca) |
+| Datos demo | `seed demo` | no aplica (cada prueba crea su esquema aislado) | `seed demo` **se niega** si `APP_ENV=production` |
+| `STORAGE_DIR` | `./data/evidence` | directorio temporal | ruta absoluta explícita, fuera de cualquier carpeta pública, con respaldo |
+
+Los puertos de las bases se publican solo en `127.0.0.1`. En producción: PostgreSQL en red privada (no expuesto a Internet), TLS hacia la base (`sslmode=require` o superior) y la API detrás de un proxy TLS. La imagen (`Dockerfile`) corre como usuario no root, trae `api`, `migrate` y `seed`, y define `HEALTHCHECK` sobre `/healthz`.
+
+## Migraciones
+`migrations/0001…0012`, solo hacia adelante, aplicadas por `go run ./cmd/migrate` (o `docker compose --profile app up`, que lo ejecuta antes de la API). Cada archivo se aplica en una transacción y se registra; ejecutar el comando de nuevo no hace nada. **Nunca se editan migraciones ya aplicadas**: un cambio de esquema es una migración nueva. Las pruebas `internal/platform/database/schema_integration_test.go` cubren BD vacía y *upgrade* con datos previos (0007–0012).
+
+## Datos de demostración
+`go run ./cmd/seed demo` crea, **a través de la API real** (con todas sus reglas y auditoría) y solo con datos ficticios: 1 Director, 2 Tutores, 2 Profesores, 6 Alumnos, 2 materias con 4 unidades, un periodo activo con los grupos 2A (5 alumnos) y 2B (1), calificaciones (incluidas NA), 10 sesiones de asistencia cerradas con ausencias, retardos y una caída de asistencia, un justificante aprobado de punta a punta y otro pendiente, 2 seguimientos tutoriales y las alertas de Analytics ya recalculadas. Cuentas: `90000001` Director · `91000001`/`91000002` Tutores · `92000001`/`92000002` Profesores · `93000001`–`93000006` Alumnos; contraseña `demo-passphrase-2026` o la de `DEMO_PASSWORD` (ficticia; cámbiala si la demo es visible desde fuera). Es **idempotente y no destructiva**: si ya existe responde "nothing to do" y solo agrega, nunca borra. Para reiniciar la demo local el único camino es descartar la base de desarrollo **explícitamente** (`docker compose down -v` borra el volumen `edutrak_pg`; no lo ejecutes si ahí hay datos que quieras conservar) y repetir migrate + seed. El QR de asistencia no está en la demo porque exige la red institucional: con `ATTENDANCE_ALLOW_ANY_NETWORK=true` (solo dev) puede probarse a mano.
 
 ## Pruebas
 ```bash
-go test ./... -race
-# integración (requiere PostgreSQL; cada test usa un esquema aislado):
-TEST_DATABASE_URL="postgres://edutrak:edutrak_dev_password@localhost:5433/edutrak_test?sslmode=disable" go test ./... -race
+gofmt -l . ; go vet ./... ; go build ./...
+docker compose up -d db-test
+export TEST_DATABASE_URL="postgres://edutrak:edutrak_dev_password@localhost:5433/edutrak_test?sslmode=disable"
+go test ./... -race -count=1 -timeout 25m            # ~6 min con PostgreSQL; sin TEST_DATABASE_URL las de integración se omiten (NO cuenta como PASS)
+go test ./... -coverprofile=coverage.out && go tool cover -func=coverage.out | tail -1
 ```
-Sin `TEST_DATABASE_URL` las pruebas de integración se omiten.
+Cada prueba de integración usa un esquema aislado. Recorridos entre módulos: `internal/app/e2e_journeys_integration_test.go` (Academic→Grades→Analytics, QR→cierre→Analytics, justificante→JUSTIFIED→alertas, cambio de tutor en todos los módulos). **Contrato:** `internal/app/openapi_contract_integration_test.go` valida `api/openapi.yaml` (documento válido, cada ruta del código documentada y viceversa, toda ruta no pública responde 401 sin token válido y respuestas reales de los siete módulos conformes a los esquemas).
+
+## Seguridad HTTP
+- Cabeceras en toda respuesta: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `Cache-Control: no-store` (las respuestas llevan tokens o datos académicos) y `X-Request-Id`. HSTS lo pone el proxy TLS.
+- CORS por orígenes exactos (`CORS_ALLOWED_ORIGINS`), sin credenciales (la autenticación es Bearer, no cookies); preflight respondido por el middleware.
+- Cuerpos JSON: `Content-Type: application/json` (otro → 415; ausente = JSON), máx. 1 MiB (413), campos desconocidos → 400. Evidencias: multipart en streaming con tope de lectura, 2 min de plazo de lectura **solo** en esa ruta (el resto: 15 s) para conexiones móviles lentas.
+- Servidor: `ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s, `WriteTimeout` 30 s, `IdleTimeout` 60 s, cabeceras ≤ 64 KiB, cierre ordenado al recibir SIGTERM (15 s).
+- Rutas inexistentes (404) y métodos incorrectos (405) responden el mismo JSON de error; los errores 500 no incluyen detalle (solo el log, con `request_id`).
+- JWT HS256 con algoritmo fijado y expiración obligatoria; el rol se lee de BD en cada petición; SQL siempre parametrizado; los ids de ruta no UUID dan 404; ADMIN no obtiene expedientes académicos.
+
+## OpenAPI
+`api/openapi.yaml` (OpenAPI 3.0.3) documenta las 74 operaciones públicas (rutas, rol requerido, parámetros, cuerpos, `multipart/form-data` de evidencias, errores, ejemplos) y el esquema Bearer. Se valida sola en cada `go test` (ver Pruebas); para verlo en un visor: `npx @redocly/cli preview-docs api/openapi.yaml` (opcional, no es dependencia del proyecto). No hay endpoint que lo sirva. La guía de consumo desde el frontend está en [`docs/FRONTEND_INTEGRATION.md`](docs/FRONTEND_INTEGRATION.md).
+
+## Operación
+- **Iniciar:** `go run ./cmd/api` o `docker compose --profile app up -d`. **Detener:** `Ctrl+C`/SIGTERM (cierre ordenado) o `docker compose --profile app down` (sin `-v`, conserva datos).
+- **Liveness** `GET /healthz` → `{"status":"ok"}` (el proceso responde). **Readiness** `GET /readyz` → 200 `{"status":"ready"}` o 503 `{"status":"unavailable"}` si PostgreSQL no contesta en 2 s; ninguno expone detalles internos.
+- **Diagnóstico:** el log (JSON en producción) trae una línea por petición (método, ruta sin query, estado, duración, `request_id`); el cliente recibe `X-Request-Id` y el mismo id en el cuerpo de error, así que un 500 se localiza buscando ese id. Nunca se registran contraseñas, tokens, QR, evidencias ni notas de tutoría. Arranque que falla: el mensaje enumera todas las variables inválidas.
+- **Respaldo:** base de datos **y** `STORAGE_DIR` juntos (los metadatos de evidencias están en la base y los archivos en el disco).
+
+## Pendientes institucionales (no inventados)
+Rangos reales de `ALLOWED_NETWORKS`/NAT; umbrales oficiales de alertas; plazo para solicitar justificantes y si el retardo se justifica; evidencia obligatoria; quién puede corregir calificaciones además del profesor; ventana para corregir asistencia cerrada; promedio/calificación final; campos estructurados de seguimiento (acuerdos, próxima revisión); alcance del DIRECTOR por carrera; zona horaria institucional definitiva.
 
 ## Endpoints
 Salud: `GET /healthz`, `GET /readyz`.
@@ -486,3 +548,7 @@ Cada módulo: `domain / application / ports / adapters`.
 - El workflow de CI está escrito pero **no se ha ejecutado en GitHub**.
 - No hay endpoint de consulta de auditoría.
 - Datos de prueba: solo ficticios (matrículas tipo `10000001`).
+- No se ha validado un despliegue real: TLS, proxy, rangos de red, respaldos y monitoreo dependen de la infraestructura de la institución. Este repositorio **no** afirma estar "listo para producción".
+- Integridad entre módulos en SQL: que la unidad pertenezca a la materia de la inscripción (Grades), que el registro de asistencia pertenezca a la asignación de su sesión, etc., se garantiza en la capa de aplicación con transacciones y bloqueos (probados), no con claves foráneas compuestas; una escritura manual en la base podría saltárselo.
+- Las ausencias generadas al cerrar una sesión usan `method = MANUAL` (el esquema exige un método) y `recorded_by` = quien cerró; se distinguen de una captura humana por `absences_created` en la respuesta del cierre y por la auditoría `attendance.session_closed`. Una columna de origen exigiría una migración futura.
+- No hay antivirus para las evidencias ni barrido de archivos huérfanos (ver Justifications).
