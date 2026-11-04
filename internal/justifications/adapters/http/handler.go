@@ -27,6 +27,9 @@ const (
 	dateLayout    = "2006-01-02"
 	maxFieldBytes = 16 << 10 // a text form field (the reason is capped far below this)
 	formOverhead  = 1 << 20  // multipart framing and the text fields
+
+	// uploadReadTimeout bounds reading a whole multipart upload (the server default is 15 s).
+	uploadReadTimeout = 2 * time.Minute
 )
 
 type Handler struct {
@@ -166,6 +169,8 @@ func (h *Handler) request(w http.ResponseWriter, r *http.Request, p iddomain.Pri
 		}
 		in = application.RequestInput{AttendanceRecordID: req.AttendanceRecordID, Reason: req.Reason}
 	case "multipart/form-data":
+		// Up to 5 files of 10 MiB can take longer than the server-wide 15 s read limit on a mobile link.
+		httpx.ExtendDeadlines(w, uploadReadTimeout, uploadReadTimeout+30*time.Second)
 		in, err = parseMultipart(r)
 		if err != nil {
 			httpx.Error(w, r, err)
