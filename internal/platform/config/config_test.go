@@ -141,6 +141,15 @@ func TestAttendanceConfigValidation(t *testing.T) {
 		{"qr ttl 60s ok", func(m map[string]string) { m["QR_TOKEN_TTL"] = "60s" }, ""},
 		{"zero late minutes", func(m map[string]string) { m["ATTENDANCE_LATE_AFTER_MINUTES"] = "0" }, "ATTENDANCE_LATE_AFTER_MINUTES"},
 		{"zero lates per absence", func(m map[string]string) { m["ATTENDANCE_LATES_PER_ABSENCE"] = "0" }, "ATTENDANCE_LATES_PER_ABSENCE"},
+		{"zero absences threshold", func(m map[string]string) { m["ANALYTICS_ABSENCES_THRESHOLD"] = "0" }, "ANALYTICS_ABSENCES_THRESHOLD"},
+		{"zero trend window", func(m map[string]string) { m["ANALYTICS_TREND_WINDOW"] = "0" }, "ANALYTICS_TREND_WINDOW"},
+		{"huge trend window", func(m map[string]string) { m["ANALYTICS_TREND_WINDOW"] = "51" }, "ANALYTICS_TREND_WINDOW"},
+		{"drop over 100 points", func(m map[string]string) { m["ANALYTICS_TREND_DROP_POINTS"] = "101" }, "ANALYTICS_TREND_DROP_POINTS"},
+		{"custom analytics thresholds", func(m map[string]string) {
+			m["ANALYTICS_ABSENCES_THRESHOLD"] = "5"
+			m["ANALYTICS_TREND_WINDOW"] = "4"
+			m["ANALYTICS_TREND_DROP_POINTS"] = "30"
+		}, ""},
 		{"bad timezone", func(m map[string]string) { m["INSTITUTION_TIMEZONE"] = "Mars/Olympus" }, "INSTITUTION_TIMEZONE"},
 	}
 	for _, tt := range tests {

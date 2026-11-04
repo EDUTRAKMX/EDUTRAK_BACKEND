@@ -39,6 +39,10 @@ type Config struct {
 	AttendanceAllowAnyNetwork  bool
 	AttendanceLateAfterMinutes int // default late threshold copied into each new session
 	AttendanceLatesPerAbsence  int // default "N lates = 1 absence" copied into each new session
+	// Analytics alert thresholds: technical proposals for the MVP, NOT institutional rules.
+	AnalyticsAbsencesThreshold int // unjustified absences in one subject that raise UNJUSTIFIED_ABSENCES
+	AnalyticsTrendWindow       int // sessions per window when comparing attendance
+	AnalyticsTrendDropPoints   int // percentage points of drop that raise ATTENDANCE_DROP
 	InstitutionTimezone        string
 	InstitutionLocation        *time.Location // used to date attendance sessions
 
@@ -128,6 +132,15 @@ func Load(getenv func(string) string) (Config, error) {
 	cfg.JustificationEvidenceRequired = required
 	cfg.AttendanceLateAfterMinutes = positiveInt("ATTENDANCE_LATE_AFTER_MINUTES", "15")
 	cfg.AttendanceLatesPerAbsence = positiveInt("ATTENDANCE_LATES_PER_ABSENCE", "3")
+	cfg.AnalyticsAbsencesThreshold = positiveInt("ANALYTICS_ABSENCES_THRESHOLD", "3")
+	cfg.AnalyticsTrendWindow = positiveInt("ANALYTICS_TREND_WINDOW", "5")
+	cfg.AnalyticsTrendDropPoints = positiveInt("ANALYTICS_TREND_DROP_POINTS", "20")
+	if cfg.AnalyticsTrendWindow > 50 {
+		errs = append(errs, fmt.Errorf("ANALYTICS_TREND_WINDOW must be at most 50"))
+	}
+	if cfg.AnalyticsTrendDropPoints > 100 {
+		errs = append(errs, fmt.Errorf("ANALYTICS_TREND_DROP_POINTS must be at most 100"))
+	}
 	cfg.InstitutionTimezone = opt("INSTITUTION_TIMEZONE", "America/Mexico_City")
 	if loc, err := time.LoadLocation(cfg.InstitutionTimezone); err != nil {
 		errs = append(errs, fmt.Errorf("INSTITUTION_TIMEZONE %q is not a valid IANA timezone", cfg.InstitutionTimezone))
