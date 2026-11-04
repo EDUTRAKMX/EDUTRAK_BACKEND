@@ -121,6 +121,19 @@ func (f *fakeRepo) UpdateRecordStatus(_ context.Context, id uuid.UUID, st domain
 	c := *r
 	return &c, nil
 }
+func (f *fakeRepo) GetAbsence(_ context.Context, id uuid.UUID, _ bool) (*domain.AbsenceRef, error) {
+	if r, ok := f.records[id]; ok {
+		return &domain.AbsenceRef{RecordID: id, Status: r.Status}, nil
+	}
+	return nil, domain.ErrRecordNotFound
+}
+func (f *fakeRepo) JustifyRecord(_ context.Context, id uuid.UUID) (bool, error) {
+	if r, ok := f.records[id]; ok && r.Status == domain.StatusAbsent {
+		r.Status = domain.StatusJustified
+		return true, nil
+	}
+	return false, nil
+}
 func (f *fakeRepo) SessionDetail(context.Context, uuid.UUID) (*domain.SessionDetail, error) {
 	f.readCalls++
 	return &domain.SessionDetail{}, nil

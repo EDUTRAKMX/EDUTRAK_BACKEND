@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,9 @@ type Config struct {
 	TrustedProxies []netip.Prefix
 	StorageDir     string
 	MaxEvidenceMB  int
+	// JustificationEvidenceRequired makes at least one evidence file mandatory for a request.
+	// The institution has not confirmed it, so it is off by default.
+	JustificationEvidenceRequired bool
 
 	// Attendance. AttendanceAllowAnyNetwork disables the network check for QR check-ins and
 	// is rejected when APP_ENV=production; an empty ALLOWED_NETWORKS otherwise allows nothing.
@@ -117,6 +121,11 @@ func Load(getenv func(string) string) (Config, error) {
 	cfg.LoginMaxFailuresPerIP = positiveInt("LOGIN_MAX_FAILURES_PER_IP", "150")
 	cfg.LoginRateWindow = dur("LOGIN_RATE_WINDOW", "15m")
 
+	required, err := strconv.ParseBool(opt("JUSTIFICATION_EVIDENCE_REQUIRED", "false"))
+	if err != nil {
+		errs = append(errs, errors.New("JUSTIFICATION_EVIDENCE_REQUIRED must be true or false"))
+	}
+	cfg.JustificationEvidenceRequired = required
 	cfg.AttendanceLateAfterMinutes = positiveInt("ATTENDANCE_LATE_AFTER_MINUTES", "15")
 	cfg.AttendanceLatesPerAbsence = positiveInt("ATTENDANCE_LATES_PER_ABSENCE", "3")
 	cfg.InstitutionTimezone = opt("INSTITUTION_TIMEZONE", "America/Mexico_City")
@@ -140,6 +149,10 @@ func Load(getenv func(string) string) (Config, error) {
 		}
 		if len(cfg.AllowedNetworks) == 0 {
 			errs = append(errs, errors.New("ALLOWED_NETWORKS is required when APP_ENV=production"))
+		}
+		// Evidence must live outside the web root: require an explicit absolute directory.
+		if getenv("STORAGE_DIR") == "" || !filepath.IsAbs(cfg.StorageDir) {
+			errs = append(errs, errors.New("STORAGE_DIR must be set to an absolute private directory when APP_ENV=production"))
 		}
 		for _, n := range cfg.AllowedNetworks {
 			if n.Bits() == 0 {

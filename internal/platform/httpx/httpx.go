@@ -77,6 +77,10 @@ func Error(w http.ResponseWriter, r *http.Request, err error) {
 			status = http.StatusNotFound
 		case apperr.KindConflict:
 			status = http.StatusConflict
+		case apperr.KindPayloadTooLarge:
+			status = http.StatusRequestEntityTooLarge
+		case apperr.KindUnsupportedMedia:
+			status = http.StatusUnsupportedMediaType
 		case apperr.KindRateLimited:
 			status = http.StatusTooManyRequests
 			if secs := int(math.Ceil(ae.RetryAfter.Seconds())); secs > 0 {

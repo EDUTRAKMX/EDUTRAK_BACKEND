@@ -13,7 +13,8 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Academic (catálogos, periodos, grupos, inscripciones, asignaciones docentes, horarios, inscripciones a materia, consultas por rol) | Implementado (`/api/academic/*`) |
 | Grades (captura y corrección de calificaciones, consulta por alumno y por asignación docente) | Implementado (`/api/grades`, `/api/students/{id}/grades`, `/api/teaching-assignments/{id}/grades`) |
 | Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
-| Justifications, Tutoring, Analytics | **No implementado** (solo tablas) |
+| Justifications (solicitud con evidencias privadas, revisión Tutor → Profesor, JUSTIFIED atómico en Attendance, consultas) | Implementado (`/api/justifications/*`) |
+| Tutoring, Analytics | **No implementado** (solo tablas) |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
@@ -28,7 +29,7 @@ go run ./cmd/api
 ```
 
 ## Variables
-`DATABASE_URL` y `JWT_SECRET` son obligatorias (el arranque falla sin ellas). Opcionales: `HTTP_PORT` (8080), `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `QR_TOKEN_TTL` (30s), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m), `ALLOWED_NETWORKS` (obligatoria en producción), `TRUSTED_PROXIES`, `ATTENDANCE_ALLOW_ANY_NETWORK` (solo dev), `ATTENDANCE_LATE_AFTER_MINUTES`, `ATTENDANCE_LATES_PER_ABSENCE`, `INSTITUTION_TIMEZONE`, `STORAGE_DIR`, `MAX_EVIDENCE_MB`, `APP_ENV`, `LOG_LEVEL`. Ver `.env.example`. Un archivo `.env` se carga si existe sin pisar variables ya definidas.
+`DATABASE_URL` y `JWT_SECRET` son obligatorias (el arranque falla sin ellas). Opcionales: `HTTP_PORT` (8080), `ACCESS_TOKEN_TTL` (15m), `REFRESH_TOKEN_TTL` (168h), `QR_TOKEN_TTL` (30s), `LOGIN_MAX_FAILURES_PER_ACCOUNT` (5), `LOGIN_MAX_FAILURES_PER_IP` (150), `LOGIN_RATE_WINDOW` (15m), `ALLOWED_NETWORKS` (obligatoria en producción), `TRUSTED_PROXIES`, `ATTENDANCE_ALLOW_ANY_NETWORK` (solo dev), `JUSTIFICATION_EVIDENCE_REQUIRED`, `ATTENDANCE_LATE_AFTER_MINUTES`, `ATTENDANCE_LATES_PER_ABSENCE`, `INSTITUTION_TIMEZONE`, `STORAGE_DIR`, `MAX_EVIDENCE_MB`, `APP_ENV`, `LOG_LEVEL`. Ver `.env.example`. Un archivo `.env` se carga si existe sin pisar variables ya definidas.
 
 ## Pruebas
 ```bash
@@ -262,11 +263,73 @@ Errores: 400 `invalid_body` · 401 · 403 `forbidden`, `network_not_allowed`, `n
 - El token QR es válido para todos los alumnos durante su vigencia; si se quisiera de un solo uso por alumno habría que cambiar el diseño.
 - No hay endpoint de listado de sesiones por fecha/profesor ni de reinscripción de un registro `JUSTIFIED`; llegarán con Justifications.
 
+### Justifications (`/api/justifications`)
+Todas las rutas exigen `Authorization: Bearer <access_token>`. La autorización es **rol + relación vigente con el recurso**, releída en cada llamada (si cambian el tutor del grupo o el profesor de la asignación, el acceso cambia de inmediato). ADMIN no obtiene solicitudes ni evidencias por serlo (403). Rutas relativas a `/api/justifications`.
+
+| Método | Ruta | Acceso |
+|---|---|---|
+| POST | `` (JSON o `multipart/form-data`) | STUDENT, solo para una ausencia propia |
+| GET | `?status=` | lista filtrada en el backend: STUDENT las suyas · TUTOR las de alumnos de sus grupos · TEACHER las de sus asignaciones · DIRECTOR todas |
+| GET | `/{id}` | el alumno dueño, el tutor del grupo, el profesor de la asignación, DIRECTOR |
+| POST | `/{id}/tutor-decision` `{"decision":"APPROVED\|REJECTED","comment"}` | TUTOR **actual** del grupo del alumno |
+| POST | `/{id}/teacher-decision` `{"decision","comment"}` | TEACHER de la asignación de la ausencia |
+| GET | `/{id}/evidence/{evidenceId}` | los mismos que el detalle |
+
+**Solicitud.** `Content-Type: application/json` (sin evidencia) → `{"attendance_record_id":"…","reason":"…"}`. Con evidencia: `multipart/form-data` con los campos de texto `attendance_record_id` y `reason` **antes** de los archivos y uno o más archivos en el campo `evidence` (máx. 5). Se lee en streaming; nada de base64.
+```http
+POST /api/justifications        Content-Type: multipart/form-data; boundary=…
+  attendance_record_id=<uuid>   reason=Consulta médica   evidence=@constancia.pdf   evidence=@receta.jpg
+-> 201 {"id":"…","attendance_record_id":"…","teaching_assignment_id":"…","status":"PENDING_TUTOR","awaiting_stage":"TUTOR",
+        "reason":"Consulta médica","student":{…},"absence":{"session_date":"2026-02-02","attendance_status":"ABSENT",
+        "group_code":"2A","subject":{"code":"MAT1","name":"…"},"academic_term":"2026-1"},
+        "evidence_count":2,"created_at":"…","updated_at":"…",
+        "evidence":[{"id":"…","original_filename":"constancia.pdf","mime_type":"application/pdf","size_bytes":1234,"created_at":"…"}],
+        "reviews":[]}
+
+POST /api/justifications/{id}/tutor-decision    {"decision":"REJECTED","comment":"Sin comprobante"}   -> 200 (mismo detalle, reviews con la decisión)
+GET  /api/justifications/{id}/evidence/{evId}   -> 200 <bytes>  Content-Type: application/pdf | image/jpeg | image/png
+        Content-Disposition: attachment; filename=…   X-Content-Type-Options: nosniff   Cache-Control: private, no-store
+```
+Una revisión devuelve `{"id","stage":"TUTOR|TEACHER","decision":"APPROVED|REJECTED","comment","reviewer":{"id","name"},"reviewed_at"}`. **Nunca** se devuelven `storage_key` ni rutas.
+
+Errores: 400 `invalid_body` (JSON/multipart mal formado, campos desconocidos, `student_id` en el cuerpo) · 401 · 403 `forbidden` · 404 `justification_not_found`, `evidence_not_found` · 409 `justification_exists`, `absence_not_eligible`, `wrong_review_stage`, `justification_finalized`, `term_closed`, `subject_enrollment_inactive` · **413** `evidence_too_large` · **415** `unsupported_evidence_type`, `evidence_type_mismatch`, `unsupported_content_type` · 422 `reason_required`, `reason_too_long`, `invalid_decision`, `comment_required`, `evidence_required`, `too_many_files`, `empty_evidence`, `invalid_filename`, `fields_after_files`, `invalid_attendance_record_id`, `attendance_record_not_found`, `invalid_status`.
+
+**Máquina de estados** (lógica explícita en `domain`, tabla de transiciones):
+```
+PENDING_TUTOR   --Tutor APPROVED--> PENDING_TEACHER --Profesor APPROVED--> JUSTIFIED         (final)
+PENDING_TUTOR   --Tutor REJECTED--> TUTOR_REJECTED                                           (final)
+                                    PENDING_TEACHER --Profesor REJECTED--> TEACHER_REJECTED  (final)
+```
+El profesor no puede decidir antes que el tutor, el tutor no puede dar la decisión final, una etapa no se decide dos veces y una solicitud finalizada es inmutable (reapertura formal fuera del MVP). Cada decisión se agrega a `justification_reviews` (historial **append-only**: no se sobrescribe la decisión del tutor con la del profesor; un rechazo no borra nada). Rechazar exige comentario; aprobar lo admite opcional. Tras un rechazo el alumno puede crear una **nueva** solicitud para la misma ausencia (el índice único parcial solo cuenta solicitudes abiertas o aprobadas).
+
+**Elegibilidad.** Solo una asistencia `ABSENT` propia, de una inscripción a materia `ACTIVE` y de un periodo no cerrado. `PRESENT`, `LATE` y `JUSTIFIED` no son justificables (no hay regla institucional para los retardos). El modelo tiene **un solo campo de texto** (`reason`, 1–2000 caracteres); no hay "motivo" y "descripción" separados. **No se define ningún plazo** (24/48/72 h): pendiente de la institución. La evidencia es **opcional** salvo `JUSTIFICATION_EVIDENCE_REQUIRED=true` (la institución no lo ha confirmado).
+
+**Integración atómica con Attendance.** Attendance sigue sin aceptar `JUSTIFIED` en sus endpoints públicos (manual y PATCH). La única vía es la operación **interna** `JustifyAbsence` de su capa de aplicación (sin endpoint), invocada desde Justifications a través de un puerto (`adapters/attendance`); Justifications nunca escribe tablas de Attendance. La decisión final favorable ejecuta, en **una** transacción PostgreSQL: estado de la solicitud → `JUSTIFIED`, revisión del profesor, `attendance_records.status` `ABSENT → JUSTIFIED` (con `UPDATE … WHERE status = 'ABSENT'`) y los eventos de auditoría. Si algo falla, todo se revierte; nunca queda una solicitud `JUSTIFIED` con la asistencia en `ABSENT` ni al revés. Si la ausencia dejó de ser `ABSENT` (p. ej. el profesor la corrigió a `PRESENT`), la **aprobación falla con 409 `absence_not_eligible`** y no se fuerza nada (el rechazo sigue siendo posible para cerrar la solicitud). Orden de bloqueos en todo el flujo: (1) fila de `attendance_records` `FOR UPDATE`, (2) fila de `justification_requests` `FOR UPDATE`; Attendance bloquea sesión y luego registro, y Justifications nunca toma la sesión, así que no hay ciclos. El bloqueo ordena las operaciones; la garantía de consistencia no depende solo de él, porque el `UPDATE` condicional es una segunda barrera.
+
+**Evidencias privadas (seguridad).**
+- Tipos: PDF, JPG/JPEG y PNG; máximo `MAX_EVIDENCE_MB` (≤ 10 MiB) por archivo, hasta 5 por solicitud. Se valida por **contenido** (firmas `%PDF-`, `FFD8FF`, `89504E47…`), por extensión y que ambas coincidan; el `Content-Type` del cliente se ignora. Ejecutables, HTML, ZIP, GIF, etc. → 415. El tamaño se corta durante la lectura (se leen a lo sumo `max+1` bytes del cliente; el cuerpo total de la petición también está acotado).
+- El nombre del cliente solo se usa para mostrar (se le quitan rutas y caracteres de control). La **clave de almacenamiento** es aleatoria (`<2 hex>/<32 hex>.<pdf|jpg|png>`) y su extensión sale del contenido, nunca del nombre; el adaptador rechaza cualquier clave con otra forma (sin `..`, separadores ni rutas absolutas), crea con `O_EXCL` (nunca sobrescribe), permisos `0700/0600`.
+- Almacenamiento: puerto `EvidenceStorage`; adaptador de filesystem en `STORAGE_DIR` (por defecto `./data/evidence`, ignorado por git). **Nunca** debe estar bajo una carpeta pública ni servida por NGINX; los archivos solo salen por `GET …/evidence/{id}`, que re-autoriza cada vez y responde con el tipo inspeccionado, `attachment`, `nosniff`, `no-store` y una CSP restrictiva. En producción `STORAGE_DIR` debe ser una ruta absoluta explícita (si no, el arranque falla). Cambiar a object storage = otra implementación del puerto.
+- **Limitaciones:** no hay antivirus ni análisis de malware (solo se comprueba el tipo); una firma válida no garantiza un documento inofensivo. No se cifra en reposo ni se hace respaldo desde la aplicación: respalda `STORAGE_DIR` junto con la base. Los archivos no son recuperables por URL.
+
+**Consistencia BD ↔ filesystem (no es atómica y no se afirma que lo sea).** Orden: (1) validar todo lo posible sin efectos laterales, (2) escribir los archivos en el almacenamiento privado con claves aleatorias que nada referencia aún, (3) **una** transacción de BD que revalida bajo bloqueo e inserta solicitud, metadatos de evidencia y auditoría, (4) si algo falla (validación, BD, auditoría, archivo posterior, cancelación), se borran los archivos escritos. Fallos de limpieza se registran (solo la clave, nunca contenido) y no tapan el error original. Si el proceso se interrumpe entre (2) y (3) quedan archivos **huérfanos** sin referencia (inofensivos, invisibles por la API); nunca hay una fila que apunte a un archivo inexistente. Pendiente: tarea de barrido que compare `storage_key` con el directorio. Una solicitud con metadatos sin archivo (borrado manual) responde 500 sin detalles y queda en el log.
+
+**Auditoría** (misma transacción que el cambio; solo ids, estados y decisión, sin archivos ni rutas): `justifications.requested` (`attendance_record_id`, `evidence_count`), `justifications.tutor_approved|tutor_rejected|teacher_approved|teacher_rejected` (`stage`, `decision`, `from`, `to`) y `attendance.justified` (entidad: el registro de asistencia).
+
+**Migración `0010`**: `UNIQUE (justification_request_id, stage)` en revisiones, trigger que impide `UPDATE`/`DELETE` del historial, `CHECK` de comentario obligatorio al rechazar y de motivo no vacío (cualquier espacio en blanco cuenta como vacío) e índice por `attendance_record_id`. Las columnas de las tres tablas ya coincidían con el modelo. `reviewed_at` se escribe con `clock_timestamp()` para que el orden del historial refleje el orden real de las decisiones. Probada en BD vacía y como upgrade con solicitud, evidencia y revisión previas.
+
+**Decisiones abiertas de Justifications**
+- Plazo máximo para solicitar (sin definir; no se aplica ninguno) y si el `LATE` puede justificarse.
+- Si la evidencia es obligatoria (hoy opcional, configurable) y el límite de 5 archivos (propuesta).
+- Qué hacer con una solicitud abierta cuando la asistencia se corrige a `PRESENT`: hoy no se cancela sola; el tutor/profesor puede rechazarla.
+- Reapertura formal, apelaciones, notificaciones y barrido de huérfanos: fuera del MVP.
+- El DIRECTOR solo consulta (no decide); confirmar si debe poder intervenir.
+
 Errores: `{"error":{"code","message","request_id"}}` — 400 cuerpo inválido, 422 validación, 401, 403, 404, 409, 429 (con `Retry-After`), 500.
 
 ## Estructura
 ```
-cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,audit}   migrations/
+cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,justifications,audit}   migrations/
 ```
 Cada módulo: `domain / application / ports / adapters`.
 

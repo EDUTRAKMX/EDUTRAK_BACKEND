@@ -127,6 +127,41 @@ func (r *Repository) UpdateRecordStatus(ctx context.Context, id uuid.UUID, statu
 		`UPDATE attendance_records SET status = $2 WHERE id = $1 RETURNING `+recordColumns, id, string(status)))
 }
 
+func (r *Repository) GetAbsence(ctx context.Context, recordID uuid.UUID, lock bool) (*domain.AbsenceRef, error) {
+	sql := `SELECT r.id, r.status, ses.id, ses.session_date, se.id, se.status, se.student_id,
+	               ta.id, ta.teacher_id, g.tutor_id, t.status
+	          FROM attendance_records r
+	          JOIN attendance_sessions ses ON ses.id = r.attendance_session_id
+	          JOIN subject_enrollments se ON se.id = r.subject_enrollment_id
+	          JOIN teaching_assignments ta ON ta.id = ses.teaching_assignment_id
+	          JOIN groups g ON g.id = ta.group_id
+	          JOIN academic_terms t ON t.id = g.academic_term_id
+	         WHERE r.id = $1`
+	if lock {
+		sql += ` FOR UPDATE OF r` // only the record row; the joined rows are read
+	}
+	var a domain.AbsenceRef
+	var status string
+	err := r.db.Q(ctx).QueryRow(ctx, sql, recordID).Scan(&a.RecordID, &status, &a.SessionID, &a.SessionDate, &a.SubjectEnrollmentID,
+		&a.EnrollmentStatus, &a.StudentID, &a.AssignmentID, &a.TeacherID, &a.GroupTutorID, &a.TermStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrRecordNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	a.Status = domain.RecordStatus(status)
+	return &a, nil
+}
+
+func (r *Repository) JustifyRecord(ctx context.Context, recordID uuid.UUID) (bool, error) {
+	tag, err := r.db.Q(ctx).Exec(ctx, `UPDATE attendance_records SET status = 'JUSTIFIED' WHERE id = $1 AND status = 'ABSENT'`, recordID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 func (c *countsAcc) add(status string) {
 	switch domain.RecordStatus(status) {
 	case domain.StatusPresent:

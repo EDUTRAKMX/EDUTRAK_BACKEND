@@ -626,3 +626,48 @@ func TestStudentAttendanceScopes(t *testing.T) {
 		t.Fatal("forbidden callers must not reach the attendance query")
 	}
 }
+
+// --- internal API used by the justification flow ---------------------------------------------------
+
+func TestJustifyAbsenceOnlyFromAbsent(t *testing.T) {
+	e := newEnv(t)
+	s := e.open()
+	mk := func(se uuid.UUID, st string) uuid.UUID {
+		r, err := e.svc.RegisterManually(ctx, e.teacher, ManualInput{SessionID: s.ID, SubjectEnrollmentID: se, Status: st})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.ID
+	}
+	absent, late := mk(e.se1, "ABSENT"), mk(e.se2, "LATE")
+
+	if err := e.svc.JustifyAbsence(ctx, late); !errors.Is(err, domain.ErrAbsenceNotEligible) {
+		t.Fatalf("LATE: %v", err)
+	}
+	if e.repo.records[late].Status != domain.StatusLate {
+		t.Fatal("a LATE record must stay LATE")
+	}
+	if err := e.svc.JustifyAbsence(ctx, absent); err != nil {
+		t.Fatal(err)
+	}
+	if e.repo.records[absent].Status != domain.StatusJustified {
+		t.Fatal("ABSENT must become JUSTIFIED")
+	}
+	if err := e.svc.JustifyAbsence(ctx, absent); !errors.Is(err, domain.ErrAbsenceNotEligible) {
+		t.Fatalf("justifying twice: %v", err)
+	}
+	if err := e.svc.JustifyAbsence(ctx, uuid.New()); !errors.Is(err, domain.ErrAbsenceNotEligible) {
+		t.Fatalf("unknown record: %v", err)
+	}
+	// the PUBLIC paths still refuse JUSTIFIED
+	if _, err := e.svc.CorrectRecord(ctx, e.teacher, late, "JUSTIFIED"); !errors.Is(err, domain.ErrStatusNotAllowed) {
+		t.Fatalf("PATCH to JUSTIFIED: %v", err)
+	}
+	if _, err := e.svc.RegisterManually(ctx, e.teacher, ManualInput{SessionID: s.ID, SubjectEnrollmentID: e.seWithdrawn, Status: "JUSTIFIED"}); !errors.Is(err, domain.ErrStatusNotAllowed) {
+		t.Fatalf("manual JUSTIFIED: %v", err)
+	}
+	// a justified record can no longer be corrected through the public endpoint
+	if _, err := e.svc.CorrectRecord(ctx, e.teacher, absent, "PRESENT"); !errors.Is(err, domain.ErrRecordJustified) {
+		t.Fatalf("correcting a JUSTIFIED record: %v", err)
+	}
+}
