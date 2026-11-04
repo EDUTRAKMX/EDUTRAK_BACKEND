@@ -771,3 +771,62 @@ func TestMigration0010HardensJustificationsWithoutLosingData(t *testing.T) {
 		t.Fatalf("the teacher's approval needs no comment: %v", err)
 	}
 }
+
+func TestMigration0011AddsTutoringContextWithoutLosingData(t *testing.T) {
+	db := dbtest.NewEmpty(t)
+	ctx := context.Background()
+	old := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_identity.sql", "0002_academic.sql", "0003_grades_attendance.sql", "0004_justifications_tutoring_analytics_audit.sql",
+		"0005_dictionary_alignment_and_session_revocation.sql", "0006_level_columns.sql", "0007_academic_dictionary_alignment.sql",
+		"0008_grades_dictionary_alignment.sql", "0009_attendance_integrity.sql", "0010_justifications_integrity.sql",
+	} {
+		body, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old[name] = &fstest.MapFile{Data: body}
+	}
+	if err := db.Migrate(ctx, old, discardLogger()); err != nil {
+		t.Fatalf("migrate to 0010: %v", err)
+	}
+	student, tutor, other := insertUser(t, db, "40000039"), insertUser(t, db, "50000039"), insertUser(t, db, "40000040")
+	career, term, group := uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO careers (id, code, name) VALUES ($1, 'TIC', 'Tecnologias')`, career)
+	mustExec(t, db, `INSERT INTO academic_terms (id, name, start_date, end_date) VALUES ($1, '2026-1', '2026-01-05', '2026-04-30')`, term)
+	mustExec(t, db, `INSERT INTO groups (id, career_id, academic_term_id, code, level, tutor_id) VALUES ($1, $2, $3, 'A1', 1, $4)`, group, career, term, tutor)
+	mustExec(t, db, `INSERT INTO enrollments (id, student_id, group_id) VALUES ($1, $2, $3)`, uuid.New(), student, group)
+	legacy := uuid.New()
+	mustExec(t, db, `INSERT INTO tutoring_followups (id, student_id, tutor_id, followup_date, note) VALUES ($1, $2, $3, '2026-02-02', 'seguimiento previo')`, legacy, student, tutor)
+
+	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
+		t.Fatalf("upgrade to latest: %v", err)
+	}
+	var note string
+	var groupID *uuid.UUID
+	if err := db.Q(ctx).QueryRow(ctx, `SELECT note, group_id FROM tutoring_followups WHERE id = $1`, legacy).Scan(&note, &groupID); err != nil {
+		t.Fatal(err)
+	}
+	if note != "seguimiento previo" || groupID != nil {
+		t.Fatalf("legacy row changed: %q %v", note, groupID)
+	}
+	ins := `INSERT INTO tutoring_followups (id, student_id, tutor_id, group_id, followup_date, note) VALUES ($1, $2, $3, $4, '2026-02-03', $5)`
+	if err := execErr(db, ins, uuid.New(), student, tutor, group, "ok"); err != nil {
+		t.Fatalf("valid follow-up rejected: %v", err)
+	}
+	if err := execErr(db, ins, uuid.New(), other, tutor, group, "ok"); err == nil {
+		t.Fatal("a student who is not enrolled in the group must be rejected (composite FK)")
+	}
+	if err := execErr(db, ins, uuid.New(), student, tutor, group, "\n\t "); err == nil {
+		t.Fatal("a whitespace-only note must be rejected")
+	}
+	if err := execErr(db, ins, uuid.New(), student, tutor, group, strings.Repeat("x", 4001)); err == nil {
+		t.Fatal("a note over 4000 characters must be rejected")
+	}
+	if err := execErr(db, `UPDATE tutoring_followups SET note = 'otra' WHERE id = $1`, legacy); err == nil {
+		t.Fatal("the history is append-only: UPDATE must fail")
+	}
+	if err := execErr(db, `DELETE FROM tutoring_followups WHERE id = $1`, legacy); err == nil {
+		t.Fatal("the history is append-only: DELETE must fail")
+	}
+}
