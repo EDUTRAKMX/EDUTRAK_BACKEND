@@ -14,7 +14,8 @@ API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento acad�
 | Grades (captura y corrección de calificaciones, consulta por alumno y por asignación docente) | Implementado (`/api/grades`, `/api/students/{id}/grades`, `/api/teaching-assignments/{id}/grades`) |
 | Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
 | Justifications (solicitud con evidencias privadas, revisión Tutor → Profesor, JUSTIFIED atómico en Attendance, consultas) | Implementado (`/api/justifications/*`) |
-| Tutoring, Analytics | **No implementado** (solo tablas) |
+| Tutoring (alumnos del tutor, resumen académico, seguimientos append-only, historial) | Implementado (`/api/tutoring/*`); sin pendientes/estados (el esquema no los tiene) |
+| Analytics | **No implementado** (solo tablas) |
 
 ## Requisitos
 Go 1.27.1 (versión declarada en `go.mod`), PostgreSQL 16 (o Docker).
@@ -325,11 +326,67 @@ El profesor no puede decidir antes que el tutor, el tutor no puede dar la decisi
 - Reapertura formal, apelaciones, notificaciones y barrido de huérfanos: fuera del MVP.
 - El DIRECTOR solo consulta (no decide); confirmar si debe poder intervenir.
 
+### Tutoring (`/api/tutoring`)
+Seguimiento tutorial: el tutor consulta a los alumnos de sus grupos, ve su situación académica (leída de Academic, Grades, Attendance y Justifications; **nada se copia** a Tutoring) y registra seguimientos. Todas las rutas exigen `Authorization: Bearer <access_token>`. La autorización es **rol + relación vigente**: el TUTOR solo opera sobre grupos donde `groups.tutor_id` es él **ahora** (se relee en cada llamada; si el grupo cambia de tutor, el anterior pierde el acceso al instante y el nuevo hereda el historial). El rol TUTOR por sí solo no basta. ADMIN, TEACHER y STUDENT reciben 403 en todo; DIRECTOR solo consulta y supervisa (no escribe seguimientos: no hay una regla que lo autorice).
+
+| Método | Ruta | Acceso |
+|---|---|---|
+| GET | `/students?academic_term_id=&group_id=&status=` | TUTOR: alumnos de sus grupos · DIRECTOR: todos. `status` = `ACTIVE` (por defecto) o `WITHDRAWN` |
+| GET | `/students/{id}?group_id=` | resumen académico de UN alumno en UN grupo (sin `group_id`: la inscripción más reciente a la que el llamante tiene acceso) |
+| GET | `/students/{id}/follow-ups?group_id=&limit=&offset=` | historial del alumno, más reciente primero |
+| POST | `/follow-ups` | solo el TUTOR actual del grupo |
+| GET | `/follow-ups?student_id=&group_id=&academic_term_id=&from=&to=&limit=&offset=` | seguimientos dentro del alcance del llamante |
+| GET | `/follow-ups/{id}` | tutor actual del grupo · DIRECTOR |
+
+```http
+POST /api/tutoring/follow-ups
+{"student_id":"<uuid>","group_id":"<uuid>","followup_date":"2026-02-10","note":"Acordamos revisar Matemáticas"}
+-> 201 {"id","student":{"id","institutional_number","first_name","last_name"},"group":{"id","code"},
+        "academic_term":{"id","name"},"author":{"id","name"},"followup_date":"2026-02-10","note":"…","created_at":"…"}
+
+GET /api/tutoring/students/{id}/follow-ups?limit=50&offset=0
+-> 200 {"data":[<seguimiento>…],"total":3,"limit":50,"offset":0}
+
+GET /api/tutoring/students -> 200 {"data":[{"student":{…},"group":{"id","code","level","tutor_id"},"career":{"code","name"},
+        "academic_term":{"id","name","status","start_date","end_date"},"enrollment_status","followups_count","last_followup_date"}]}
+
+GET /api/tutoring/students/{id}?group_id=…
+-> 200 {"enrollment":{…como arriba…},"subjects":[{"subject_enrollment_id","teaching_assignment_id","subject":{"code","name"},"teacher":{"name"},
+        "attempt_number","status",
+        "grades":{"units_total":7,"units_graded":2,"units":[{"subject_unit_id","unit_number","unit_name","grade":{"score":90.00,"category":"DE"}|null}]},
+        "attendance":{"present","late","absent","justified","total","lates_per_absence","absences_from_lates","effective_absences"},
+        "justifications":{"pending","approved","rejected"}}]}
+```
+- `followup_date` es opcional (por defecto, hoy en la zona horaria institucional). Debe estar entre el inicio del periodo del grupo y hoy; no puede ser futura.
+- `author` sale del token, **nunca** del cuerpo (cualquier campo desconocido, como un `tutor_id`, da 400) y se conserva aunque el grupo cambie de tutor.
+- Resumen académico: `grade: null` = unidad sin capturar (**no** es 0.00; un 0.00 capturado sí aparece con categoría `NA`). Categorías NA/SA/DE/AU con las reglas de Grades. `absences_from_lates` y `effective_absences` siguen la regla de Attendance (N retardos = 1 falta, solo indicador; N sale de la sesión abierta más recientemente; sin sesiones, `lates_per_absence` es `null` y no se deriva nada). **No hay promedios, calificación final, puntaje de riesgo, predicciones ni alertas**: eso es Analytics y la institución no ha definido criterios.
+- Dos consultas SQL constantes para el resumen (materias+asistencia+justificaciones, y unidades+calificaciones) y una para la lista de alumnos con contadores, sin N+1.
+
+Errores: 400 `invalid_body` (JSON mal formado o campos desconocidos) · 401 · 403 `forbidden` · 404 `student_not_found`, `followup_not_found`, `enrollment_not_found` (el alumno no está inscrito en el `group_id` de la URL) · 409 `term_closed`, `enrollment_inactive` · 422 `note_required`, `note_too_long` (máx. 4000 caracteres), `invalid_followup_date`, `followup_date_in_future`, `followup_date_before_term`, `invalid_student_id`, `invalid_group_id`, `student_not_found` / `group_not_found` / `student_not_enrolled` (referencias del cuerpo), `invalid_filter`, `invalid_paging` (`limit` 1–200, `offset` ≥ 0).
+
+**Reglas.**
+- Un seguimiento pertenece a una inscripción concreta (alumno + grupo, y por tanto periodo). Un alumno con inscripciones en varios grupos/periodos tiene historiales **separados**; el `group_id` los distingue y nunca se mezclan. El TUTOR ve los seguimientos de los grupos que tutela hoy, sin importar quién los escribió.
+- Escribir exige: rol TUTOR + ser el tutor actual del grupo + inscripción `ACTIVE` + periodo no cerrado (el grupo y su periodo se bloquean `FOR SHARE` durante la transacción: un cambio de tutor o el cierre del periodo concurrente no puede colarse entre la comprobación y la escritura).
+- El historial es **append-only**: cada intervención es una fila nueva; no hay edición ni borrado (un trigger lo impide también en SQL). No se crean restricciones de unicidad: varios seguimientos del mismo alumno el mismo día son legítimos.
+- **Privacidad.** El texto (`note`) solo se devuelve a quien tiene relación vigente. Nunca va a logs ni a la auditoría, ni aparece en errores. No lo uses para diagnósticos médicos/psicológicos: debe limitarse al acompañamiento académico (es una regla de uso, el sistema no puede verificarla).
+- **Auditoría** (misma transacción; si falla, no se guarda el seguimiento): `tutoring.followup_created` con `student_id`, `group_id` y `followup_date` (sin texto). Las lecturas no se auditan.
+
+**Migración `0011`** (`tutoring_followups` ya existía con `id, student_id, tutor_id, followup_date, note, created_at`): añade `group_id` (nullable solo por las filas previas; la aplicación siempre lo fija) con FK compuesta `(student_id, group_id) → enrollments`, `CHECK` de nota no vacía (cualquier espacio en blanco cuenta como vacío) y ≤ 4000 caracteres, trigger append-only e índice `(group_id, followup_date DESC, created_at DESC)`. Probada en BD vacía y como upgrade con una fila previa.
+
+**Diferencias con el prompt/diccionario.** La tabla solo tiene **una** nota de texto: no hay campos separados de observación, acción o acuerdo, ni estado, ni fecha de próxima revisión. No se inventaron columnas para ellos. Por eso **no existen** los "seguimientos pendientes" (acuerdos abiertos, próximas revisiones) ni la actualización de estado: quedan como decisión abierta. La nota puede contener acciones/acuerdos como texto libre.
+
+**Decisiones abiertas de Tutoring**
+- Si el seguimiento necesita campos estructurados (acción, acuerdo, próxima revisión, estado) para soportar "pendientes"; sin ellos no se implementa esa consulta.
+- Si un tutor nuevo debe ver los seguimientos de **otros grupos/periodos** previos del alumno (hoy solo los de los grupos que tutela ahora).
+- Si el DIRECTOR (o el alumno, con acuerdos visibles) debe poder escribir o leer algo más; si se permiten correcciones (hoy no: se registra otro seguimiento).
+- Si un periodo cerrado debe bloquear también los seguimientos (hoy sí, por coherencia con el resto).
+- Si el seguimiento aplica a alumnos con inscripción `WITHDRAWN` (hoy no se pueden añadir; el historial se conserva).
+
 Errores: `{"error":{"code","message","request_id"}}` — 400 cuerpo inválido, 422 validación, 401, 403, 404, 409, 429 (con `Retry-After`), 500.
 
 ## Estructura
 ```
-cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,justifications,audit}   migrations/
+cmd/{api,migrate,seed}   internal/{app,platform,identity,academic,grades,attendance,justifications,tutoring,audit}   migrations/
 ```
 Cada módulo: `domain / application / ports / adapters`.
 
