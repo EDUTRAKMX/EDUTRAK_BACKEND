@@ -1,0 +1,2099 @@
+openapi: 3.0.3
+info:
+  title: EDUTRAK Backend API
+  version: 1.0.0-mvp
+  description: |
+    REST API of the EDUTRAK academic follow-up platform (modular monolith in Go + PostgreSQL).
+
+    **Conventions**
+    - Authentication: `Authorization: Bearer <access_token>` (JWT, short lived). Renew with `POST /api/auth/refresh`.
+    - Authorization is **role + relationship with the resource**, evaluated on every call. ADMIN manages accounts only
+      and never gets academic records (403).
+    - Errors always look like `{"error":{"code","message","request_id"}}`. Status mapping: 400 `invalid_body`,
+      401 unauthenticated, 403 forbidden, 404 not found (also a non-UUID id), 409 state conflict,
+      413 payload too large, 415 unsupported media type, 422 validation (also an unknown reference inside a body),
+      429 rate limited (`Retry-After`), 500 `internal_error` (details only in server logs). Unknown routes answer
+      404 `not_found` and a wrong method 405 `method_not_allowed`, also as JSON.
+    - JSON bodies reject unknown fields (400) and must be `application/json` (415 otherwise; a missing Content-Type is
+      treated as JSON); the limit is 1 MiB (413).
+    - Lists answer `{"data":[...]}`; only Tutoring follow-ups and Analytics alerts are paginated
+      (`limit` 1-200, `offset` >= 0 and `total` in the answer).
+    - Dates are `YYYY-MM-DD` (institution time zone, `INSTITUTION_TIMEZONE`, default `America/Mexico_City`);
+      instants are RFC 3339 in UTC.
+    - Grades are exact numbers with at most two decimals (0-100).
+
+    **Cross-origin browsers**: allowed origins are configured with `CORS_ALLOWED_ORIGINS` (exact origins, never `*`).
+    Every response carries `X-Request-Id`, `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+    Thresholds used by Analytics alerts are MVP technical proposals, not institutional rules.
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8080
+    description: Local development
+tags:
+  - name: Health
+  - name: Identity
+  - name: Academic
+  - name: Grades
+  - name: Attendance
+  - name: Justifications
+  - name: Tutoring
+  - name: Analytics
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness
+      description: The process is running. Public, no dependencies checked.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema: {type: object, properties: {status: {type: string, enum: [ok]}}}
+              example: {status: ok}
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness
+      description: PostgreSQL answers within 2 seconds. Public; never exposes internal details.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: {type: object, properties: {status: {type: string, enum: [ready]}}}
+              example: {status: ready}
+        '503':
+          description: A dependency is unavailable
+          content:
+            application/json:
+              schema: {type: object, properties: {status: {type: string, enum: [unavailable]}}}
+
+  # ------------------------------------------------------------------ Identity
+  /api/auth/login:
+    post:
+      tags: [Identity]
+      summary: Log in
+      description: |
+        Public. Rate limited per account+IP and per IP (429 with `Retry-After`). A wrong password and an unknown
+        account answer exactly the same 401. A disabled account answers 401 too.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+            example: {institutional_number: '40000001', password: 'student-passphrase-123'}
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /api/auth/refresh:
+    post:
+      tags: [Identity]
+      summary: Rotate the refresh token
+      description: |
+        Public (the refresh token is the credential). Each refresh token works once: the answer carries a new pair.
+        A revoked token is always 401. Reusing an already rotated token after the 10 s grace revokes the user's active
+        sessions (`REUSE_DETECTED`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties: {refresh_token: {type: string}}
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /api/auth/logout:
+    post:
+      tags: [Identity]
+      summary: Log out (revokes the current session)
+      description: Allowed even while `must_change_password` is true.
+      responses:
+        '204': {description: Session revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /api/auth/me:
+    get:
+      tags: [Identity]
+      summary: Current user
+      description: Allowed even while `must_change_password` is true. Roles are read from the database on every call.
+      responses:
+        '200':
+          description: The authenticated user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /api/auth/password:
+    patch:
+      tags: [Identity]
+      summary: Change own password
+      description: |
+        Requires the current password. Keeps the session used for the change and revokes every other one. Clears
+        `must_change_password`. Allowed while `must_change_password` is true.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: {type: string}
+                new_password: {type: string, minLength: 10}
+      responses:
+        '204': {description: Password changed}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/admin/users:
+    post:
+      tags: [Identity]
+      summary: Create a user
+      description: |
+        **ADMIN only.** The account is created with `must_change_password = true`: until the user changes the
+        password, only `me`, `logout` and `password` work.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateUserRequest'}
+            example:
+              institutional_number: '40000010'
+              first_name: Alumno
+              last_name: Ficticio
+              password: temporary-passphrase-123
+              roles: [STUDENT]
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/admin/users/{id}/password:
+    put:
+      tags: [Identity]
+      summary: Reset a user's password
+      description: '**ADMIN only.** Sets a temporary password, revokes all the user''s sessions and forces a change at next login. The password is never returned.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [temporary_password]
+              properties: {temporary_password: {type: string, minLength: 10}}
+      responses:
+        '204': {description: Password reset}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  # ------------------------------------------------------------------ Academic
+  /api/academic/careers:
+    get:
+      tags: [Academic]
+      summary: List careers
+      description: Any authenticated user (institutional catalog).
+      responses:
+        '200': {$ref: '#/components/responses/CareerList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      tags: [Academic]
+      summary: Create a career
+      description: '**DIRECTOR.**'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CodeNameRequest'}
+            example: {code: tic, name: Tecnologías de la Información}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Career'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/careers/{id}:
+    get:
+      tags: [Academic]
+      summary: Get a career
+      description: Any authenticated user.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The career
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Career'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/careers/{id}/curriculum:
+    get:
+      tags: [Academic]
+      summary: Curriculum of a career
+      description: Any authenticated user.
+      parameters:
+        - {$ref: '#/components/parameters/Id'}
+        - {name: level, in: query, schema: {type: integer, minimum: 1}, description: Only this level}
+      responses:
+        '200':
+          description: Subjects of the plan
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/CurriculumEntry'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    post:
+      tags: [Academic]
+      summary: Add a subject to the plan of a career at a level
+      description: '**DIRECTOR.**'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_id, level]
+              properties:
+                subject_id: {type: string, format: uuid}
+                level: {type: integer, minimum: 1}
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CurriculumEntry'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/subjects:
+    get:
+      tags: [Academic]
+      summary: List subjects
+      description: Any authenticated user.
+      responses:
+        '200':
+          description: Subjects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Subject'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      tags: [Academic]
+      summary: Create a subject
+      description: '**DIRECTOR.**'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CodeNameRequest'}
+            example: {code: MAT1, name: Matemáticas I}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Subject'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/subjects/{id}:
+    get:
+      tags: [Academic]
+      summary: Get a subject
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The subject
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Subject'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/subjects/{id}/units:
+    get:
+      tags: [Academic]
+      summary: Units of a subject
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Units ordered by number
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/SubjectUnit'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Academic]
+      summary: Create a unit
+      description: '**DIRECTOR.**'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [unit_number, name]
+              properties:
+                unit_number: {type: integer, minimum: 1}
+                name: {type: string}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SubjectUnit'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/terms:
+    get:
+      tags: [Academic]
+      summary: List academic terms
+      description: '**DIRECTOR.**'
+      responses:
+        '200':
+          description: Terms
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Term'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+    post:
+      tags: [Academic]
+      summary: Create an academic term (status `draft`)
+      description: '**DIRECTOR.**'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, start_date, end_date]
+              properties:
+                name: {type: string, maxLength: 80}
+                start_date: {type: string, format: date}
+                end_date: {type: string, format: date}
+            example: {name: 2026-1, start_date: '2026-01-05', end_date: '2026-04-30'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Term'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/terms/{id}:
+    get:
+      tags: [Academic]
+      summary: Get a term
+      description: '**DIRECTOR.**'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The term
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Term'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/terms/{id}/activate:
+    post:
+      tags: [Academic]
+      summary: draft -> active
+      description: '**DIRECTOR.** No body. Invalid transition: 409 `invalid_term_transition`.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The term
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Term'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/academic/terms/{id}/close:
+    post:
+      tags: [Academic]
+      summary: active -> closed (final)
+      description: '**DIRECTOR.** No body. A closed term freezes grades, attendance, justifications, tutoring and alerts of its groups (409 `term_closed`).'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The term
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Term'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/academic/groups:
+    get:
+      tags: [Academic]
+      summary: List visible groups
+      description: 'DIRECTOR: all; TEACHER: groups where they have an assignment; TUTOR: groups they tutor; STUDENT: groups where actively enrolled. ADMIN: 403.'
+      parameters:
+        - {name: academic_term_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Groups
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Group'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    post:
+      tags: [Academic]
+      summary: Create a group
+      description: '**DIRECTOR.** Active career, term not closed, code unique per term (stored upper case), optional active TUTOR.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [academic_term_id, career_id, code, level]
+              properties:
+                academic_term_id: {type: string, format: uuid}
+                career_id: {type: string, format: uuid}
+                code: {type: string}
+                level: {type: integer, minimum: 1}
+                tutor_id: {type: string, format: uuid, nullable: true}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Group'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/groups/{id}:
+    get:
+      tags: [Academic]
+      summary: Get a group
+      description: DIRECTOR, tutor of the group, teacher with an assignment in it, enrolled student.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The group
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Group'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/groups/{id}/tutor:
+    put:
+      tags: [Academic]
+      summary: Set or remove the tutor of a group
+      description: '**DIRECTOR.** `tutor_id: null` removes the tutor. The previous tutor loses access immediately in Tutoring, Analytics and Justifications; the new one inherits the history.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tutor_id]
+              properties:
+                tutor_id: {type: string, format: uuid, nullable: true}
+      responses:
+        '200':
+          description: The group
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Group'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/groups/{id}/enrollments:
+    get:
+      tags: [Academic]
+      summary: Students enrolled in a group
+      description: DIRECTOR and the tutor of that group.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Enrollments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Enrollment'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Academic]
+      summary: Enroll a student in a group
+      description: '**DIRECTOR.** The student must have an active STUDENT role.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [student_id]
+              properties: {student_id: {type: string, format: uuid}}
+      responses:
+        '201':
+          description: Enrolled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Enrollment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/groups/{id}/teaching-assignments:
+    get:
+      tags: [Academic]
+      summary: Teaching assignments of a group
+      description: Whoever can see the group; each role sees only its own assignments.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200': {$ref: '#/components/responses/AssignmentList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Academic]
+      summary: Assign a teacher to a subject of the group
+      description: '**DIRECTOR.** The subject must be in the curriculum of the group''s career at the group''s level; one subject per group.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_id, teacher_id]
+              properties:
+                subject_id: {type: string, format: uuid}
+                teacher_id: {type: string, format: uuid}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TeachingAssignment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/teaching-assignments:
+    get:
+      tags: [Academic]
+      summary: List visible teaching assignments
+      description: 'DIRECTOR: all; teacher: their own; tutor: those of their groups; student: where they have a subject enrollment. Filtering by a foreign group: 403.'
+      parameters:
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {$ref: '#/components/responses/AssignmentList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/teaching-assignments/{id}:
+    get:
+      tags: [Academic]
+      summary: Get a teaching assignment
+      description: DIRECTOR, its teacher, tutor of the group, student with a subject enrollment in it.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The assignment
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TeachingAssignment'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/teaching-assignments/{id}/teacher:
+    put:
+      tags: [Academic]
+      summary: Change the teacher of an assignment
+      description: '**DIRECTOR.** The previous teacher loses access immediately.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [teacher_id]
+              properties: {teacher_id: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: The assignment
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TeachingAssignment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/teaching-assignments/{id}/students:
+    get:
+      tags: [Academic]
+      summary: Students (subject enrollments) of an assignment
+      description: DIRECTOR and the teacher of that assignment.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200': {$ref: '#/components/responses/SubjectEnrollmentList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/academic/teaching-assignments/{id}/schedules:
+    get:
+      tags: [Academic]
+      summary: Schedules of an assignment
+      description: Same visibility as the assignment.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200': {$ref: '#/components/responses/ScheduleList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      tags: [Academic]
+      summary: Add a schedule slot
+      description: '**DIRECTOR.** `day_of_week` 1-7, `HH:MM`, start < end; slots of one assignment cannot overlap.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [day_of_week, start_time, end_time]
+              properties:
+                day_of_week: {type: integer, minimum: 1, maximum: 7}
+                start_time: {type: string, example: '08:00'}
+                end_time: {type: string, example: '10:00'}
+                classroom: {type: string}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Schedule'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/teaching-assignments/{id}/subject-enrollments:
+    post:
+      tags: [Academic]
+      summary: Subject-enroll the whole group (idempotent)
+      description: '**DIRECTOR.** No body. Creates a subject enrollment for every active student of the group that lacks one.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Number of enrollments created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {created: {type: integer}}
+              example: {created: 2}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/academic/schedules:
+    get:
+      tags: [Academic]
+      summary: Own schedule by role
+      description: DIRECTOR sees all; other roles see the slots of the assignments they are related to.
+      parameters:
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Schedule slots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/ScheduleDetail'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/academic/subject-enrollments:
+    get:
+      tags: [Academic]
+      summary: List subject enrollments
+      description: 'DIRECTOR: all (filterable); TEACHER: those of their assignments; STUDENT: only their own (a foreign `student_id` is ignored).'
+      parameters:
+        - {name: teaching_assignment_id, in: query, schema: {type: string, format: uuid}}
+        - {name: student_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {$ref: '#/components/responses/SubjectEnrollmentList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    post:
+      tags: [Academic]
+      summary: Subject-enroll one student
+      description: |
+        **DIRECTOR.** The student needs an active enrollment in the group of the assignment. `attempt_number` is
+        optional and, if sent, must be the next attempt for that student and subject. Repeating the call: 409
+        `subject_enrollment_exists`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [student_id, teaching_assignment_id]
+              properties:
+                student_id: {type: string, format: uuid}
+                teaching_assignment_id: {type: string, format: uuid}
+                attempt_number: {type: integer, minimum: 1}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SubjectEnrollment'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  # ------------------------------------------------------------------ Grades
+  /api/grades:
+    post:
+      tags: [Grades]
+      summary: Capture a unit grade
+      description: |
+        **TEACHER responsible for the assignment only** (never DIRECTOR/TUTOR/STUDENT/ADMIN). The recorder is the
+        authenticated teacher; `recorded_by` in the body is rejected (400). One grade per (subject enrollment, unit):
+        a repeated POST is 409 `grade_exists` and never overwrites. Needs an `ACTIVE` subject enrollment and a term
+        that is not closed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CaptureGradeRequest'}
+            example: {subject_enrollment_id: 00000000-0000-4000-8000-000000000001, subject_unit_id: 00000000-0000-4000-8000-000000000002, score: 89.99}
+      responses:
+        '201':
+          description: Captured
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Grade'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/grades/{id}:
+    get:
+      tags: [Grades]
+      summary: Get a grade
+      description: Owner student, teacher of the assignment, tutor of the group, DIRECTOR.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The grade
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Grade'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    patch:
+      tags: [Grades]
+      summary: Correct a grade
+      description: Same teacher only. A value equal to the current one is a no-op. The correction is audited (from/to).
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [score]
+              properties:
+                score: {type: number, minimum: 0, maximum: 100, description: 'At most two decimals; more are rejected, never rounded'}
+            example: {score: 90}
+      responses:
+        '200':
+          description: The grade
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Grade'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/students/{id}/grades:
+    get:
+      tags: [Grades]
+      summary: Grade sheet of a student
+      description: 'STUDENT: only their own id; TEACHER: only attempts of their assignments; TUTOR: groups they tutor; DIRECTOR: any; ADMIN: 403. A unit without a grade is `grade: null` (never 0.00).'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Grades per subject enrollment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  student_id: {type: string, format: uuid}
+                  data: {type: array, items: {$ref: '#/components/schemas/StudentSubjectGrades'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/teaching-assignments/{id}/grades:
+    get:
+      tags: [Grades]
+      summary: Grade table of an assignment
+      description: Teacher of the assignment, tutor of the group, DIRECTOR.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: One row per student, one cell per unit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  teaching_assignment_id: {type: string, format: uuid}
+                  group_id: {type: string, format: uuid}
+                  group_code: {type: string}
+                  subject: {type: object, additionalProperties: true}
+                  units: {type: array, items: {$ref: '#/components/schemas/SubjectUnit'}}
+                  students: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ------------------------------------------------------------------ Attendance
+  /api/attendance/sessions:
+    post:
+      tags: [Attendance]
+      summary: Open an attendance session
+      description: |
+        **TEACHER responsible for the assignment.** One OPEN session per assignment (409 `session_already_open`).
+        `late_after_minutes` (1-1440) and `lates_per_absence` (1-100) default to the server configuration and are
+        copied into the session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [teaching_assignment_id]
+              properties:
+                teaching_assignment_id: {type: string, format: uuid}
+                schedule_id: {type: string, format: uuid}
+                late_after_minutes: {type: integer}
+                lates_per_absence: {type: integer}
+      responses:
+        '201':
+          description: Opened
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceSession'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/attendance/sessions/{id}:
+    get:
+      tags: [Attendance]
+      summary: Session detail with one row per active student
+      description: Teacher of the assignment, tutor of the group, DIRECTOR.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Session, counts and students
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: {$ref: '#/components/schemas/AttendanceSession'}
+                  counts: {$ref: '#/components/schemas/AttendanceCounts'}
+                  pending: {type: integer}
+                  students: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/attendance/sessions/{id}/qr/rotate:
+    post:
+      tags: [Attendance]
+      summary: Issue a new QR token (invalidates the previous one)
+      description: |
+        **Responsible teacher**, session OPEN. The token (256 bits, base64url) is returned only here; the database
+        keeps just its SHA-256. Call it about every `QR_TOKEN_TTL` (30 s by default) and draw a QR carrying
+        `{session_id, token}`. The response is `Cache-Control: no-store`.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: New token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attendance_session_id: {type: string, format: uuid}
+                  token: {type: string}
+                  expires_at: {type: string, format: date-time}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/attendance/sessions/{id}/check-in:
+    post:
+      tags: [Attendance]
+      summary: Student check-in by QR
+      description: |
+        **STUDENT** actively subject-enrolled in the assignment, from an allowed institutional network (the client IP
+        comes from the connection or from trusted proxies, never from the body). The student is always the token's
+        user; `student_id`, `ip`, `status` or a time in the body are rejected (400). `PRESENT` before
+        `opened_at + late_after_minutes`, `LATE` from then on (server time). A second check-in is 409.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties: {token: {type: string}}
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/attendance/sessions/{id}/manual:
+    post:
+      tags: [Attendance]
+      summary: Manual capture by the teacher
+      description: '**Responsible teacher**, session OPEN. Only `PRESENT`, `LATE`, `ABSENT`; `JUSTIFIED` is never accepted here (422 `status_not_allowed`). Does not depend on the network or the QR.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject_enrollment_id, status]
+              properties:
+                subject_enrollment_id: {type: string, format: uuid}
+                status: {type: string, enum: [PRESENT, LATE, ABSENT]}
+      responses:
+        '201':
+          description: Recorded (method MANUAL)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/attendance/sessions/{id}/close:
+    post:
+      tags: [Attendance]
+      summary: Close the session
+      description: |
+        **Responsible teacher.** In one transaction: creates an `ABSENT` record (method `MANUAL`, `recorded_by` = who
+        closes) for every ACTIVE subject enrollment without a record, deletes the QR and marks the session CLOSED.
+        A second close is 409. Generated absences use `MANUAL` because the schema requires a method; they are
+        distinguishable by `recorded_by` and by the `absences_created` count of this answer.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Closed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session: {$ref: '#/components/schemas/AttendanceSession'}
+                  absences_created: {type: integer}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+  /api/attendance/records/{id}:
+    patch:
+      tags: [Attendance]
+      summary: Correct a record
+      description: '**Responsible teacher**, term not closed, open or closed sessions. Only PRESENT/LATE/ABSENT; a JUSTIFIED record cannot be touched (409 `record_justified`). Audited.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [PRESENT, LATE, ABSENT]}
+      responses:
+        '200':
+          description: The record
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/attendance/teaching-assignments/{id}:
+    get:
+      tags: [Attendance]
+      summary: Attendance summary of an assignment
+      description: Teacher of the assignment, tutor of the group, DIRECTOR. `absences_from_lates` and `effective_absences` are indicators; LATE records are never rewritten.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Sessions and per-student counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  teaching_assignment_id: {type: string, format: uuid}
+                  total_sessions: {type: integer}
+                  sessions: {type: array, items: {type: object, additionalProperties: true}}
+                  students: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/attendance/students/{id}:
+    get:
+      tags: [Attendance]
+      summary: Attendance history of a student
+      description: 'STUDENT: only their own id; TEACHER: attempts of their assignments; TUTOR: groups they tutor; DIRECTOR: any.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Records per subject enrollment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  student_id: {type: string, format: uuid}
+                  data: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ------------------------------------------------------------------ Justifications
+  /api/justifications:
+    post:
+      tags: [Justifications]
+      summary: Request the justification of an own absence
+      description: |
+        **STUDENT**, only for an own record in state `ABSENT` (ACTIVE enrollment, term not closed). The student is the
+        token's user. Send JSON (no evidence) or `multipart/form-data`: the text fields `attendance_record_id` and
+        `reason` **before** the files and 0-5 files in the field `evidence` (PDF/JPG/PNG validated by content, at most
+        `MAX_EVIDENCE_MB`, 10 MiB; the Content-Type declared by the client for each part is ignored). Evidence is optional unless `JUSTIFICATION_EVIDENCE_REQUIRED=true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/JustificationRequestBody'}
+            example: {attendance_record_id: 00000000-0000-4000-8000-000000000003, reason: Consulta médica}
+          multipart/form-data:
+            schema:
+              type: object
+              required: [attendance_record_id, reason]
+              properties:
+                attendance_record_id: {type: string, format: uuid}
+                reason: {type: string, minLength: 1, maxLength: 2000}
+                evidence:
+                  type: array
+                  maxItems: 5
+                  items: {type: string, format: binary}
+      responses:
+        '201':
+          description: Created, waiting for the tutor
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Justification'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedMedia'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    get:
+      tags: [Justifications]
+      summary: List requests visible to the caller
+      description: 'STUDENT: their own; TUTOR: students of the groups they tutor now; TEACHER: those of their assignments; DIRECTOR: all.'
+      parameters:
+        - name: status
+          in: query
+          schema: {$ref: '#/components/schemas/JustificationStatus'}
+      responses:
+        '200':
+          description: Requests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Justification'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/justifications/{id}:
+    get:
+      tags: [Justifications]
+      summary: Request detail with evidence metadata and review history
+      description: Owner student, tutor of the group, teacher of the assignment, DIRECTOR. `storage_key` is never returned.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Justification'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/justifications/{id}/tutor-decision:
+    post:
+      tags: [Justifications]
+      summary: Tutor decision (first stage)
+      description: '**Current TUTOR of the student''s group.** Only while `PENDING_TUTOR`. `REJECTED` requires a comment and ends the flow (`TUTOR_REJECTED`); `APPROVED` moves it to `PENDING_TEACHER`.'
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DecisionRequest'}
+            example: {decision: REJECTED, comment: Sin comprobante}
+      responses:
+        '200':
+          description: The updated request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Justification'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/justifications/{id}/teacher-decision:
+    post:
+      tags: [Justifications]
+      summary: Teacher decision (final stage)
+      description: |
+        **TEACHER of the assignment of the absence.** Only while `PENDING_TEACHER`. `APPROVED` runs, in ONE
+        transaction: request -> `JUSTIFIED`, review, attendance record `ABSENT` -> `JUSTIFIED` and audit. If the
+        absence is no longer `ABSENT` the approval fails with 409 `absence_not_eligible` and nothing changes.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DecisionRequest'}
+      responses:
+        '200':
+          description: The updated request
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Justification'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/justifications/{id}/evidence/{evidenceId}:
+    get:
+      tags: [Justifications]
+      summary: Download an evidence file
+      description: |
+        Same visibility as the request, re-authorized on every call. Answers the file bytes with the content type
+        detected at upload, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`,
+        `Cache-Control: private, no-store` and a restrictive CSP. Send the Bearer token with `fetch` and save the blob; a
+        plain `<a href>` cannot carry the header.
+      parameters:
+        - {$ref: '#/components/parameters/Id'}
+        - {name: evidenceId, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: The file
+          headers:
+            Content-Disposition: {schema: {type: string}}
+          content:
+            application/pdf: {schema: {type: string, format: binary}}
+            image/jpeg: {schema: {type: string, format: binary}}
+            image/png: {schema: {type: string, format: binary}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ------------------------------------------------------------------ Tutoring
+  /api/tutoring/students:
+    get:
+      tags: [Tutoring]
+      summary: Students of the caller's groups
+      description: 'TUTOR: students of the groups they tutor now; DIRECTOR: all. ADMIN/TEACHER/STUDENT: 403.'
+      parameters:
+        - {name: academic_term_id, in: query, schema: {type: string, format: uuid}}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+        - {name: status, in: query, schema: {type: string, enum: [ACTIVE, WITHDRAWN], default: ACTIVE}}
+      responses:
+        '200':
+          description: One row per enrollment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/tutoring/students/{id}:
+    get:
+      tags: [Tutoring]
+      summary: Academic summary of one student in one group
+      description: Read from Academic, Grades, Attendance and Justifications (nothing is copied). Without `group_id` the most recent accessible enrollment is used. No averages, risk scores or predictions.
+      parameters:
+        - {$ref: '#/components/parameters/Id'}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Summary
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/tutoring/students/{id}/follow-ups:
+    get:
+      tags: [Tutoring]
+      summary: Follow-up history of a student
+      description: Most recent first; separated per group via `group_id`.
+      parameters:
+        - {$ref: '#/components/parameters/Id'}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Offset'}
+      responses:
+        '200': {$ref: '#/components/responses/FollowUpPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/tutoring/follow-ups:
+    post:
+      tags: [Tutoring]
+      summary: Record a follow-up (append-only)
+      description: |
+        **Current TUTOR of the group only** (DIRECTOR reads, never writes). The author is the token's user (an unknown
+        field such as `tutor_id` is 400). `followup_date` defaults to today in the institution time zone; it cannot be
+        future nor before the term started. The note is never logged or audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [student_id, group_id, note]
+              properties:
+                student_id: {type: string, format: uuid}
+                group_id: {type: string, format: uuid}
+                followup_date: {type: string, format: date}
+                note: {type: string, maxLength: 4000}
+            example: {student_id: 00000000-0000-4000-8000-000000000004, group_id: 00000000-0000-4000-8000-000000000005, followup_date: '2026-02-10', note: Acordamos revisar Matemáticas}
+      responses:
+        '201':
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FollowUp'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    get:
+      tags: [Tutoring]
+      summary: List follow-ups within the caller's scope
+      parameters:
+        - {name: student_id, in: query, schema: {type: string, format: uuid}}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+        - {name: academic_term_id, in: query, schema: {type: string, format: uuid}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Offset'}
+      responses:
+        '200': {$ref: '#/components/responses/FollowUpPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/tutoring/follow-ups/{id}:
+    get:
+      tags: [Tutoring]
+      summary: Get a follow-up
+      description: Current tutor of the group, DIRECTOR.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The follow-up
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FollowUp'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ------------------------------------------------------------------ Analytics
+  /api/analytics/students/{id}:
+    get:
+      tags: [Analytics]
+      summary: Indicators of one student in one group
+      description: |
+        **TUTOR** of the group now, or **DIRECTOR**. Computed live from the other modules on every call. `signals`
+        are the alert rules evaluated now; `alerts` are the persisted alerts as of the last recalculation. Only
+        CLOSED sessions count; `attendance_pct` is attendance **adjusted by justifications**:
+        (present+late)/(present+late+absent), JUSTIFIED excluded from the denominator, `null` without a denominator
+        (never 0%).
+      parameters:
+        - {$ref: '#/components/parameters/Id'}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}, description: Without it the most recent enrollment the caller can access is used}
+      responses:
+        '200':
+          description: Indicators
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StudentAnalytics'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/analytics/groups/{id}:
+    get:
+      tags: [Analytics]
+      summary: Aggregated indicators of a group
+      description: TUTOR of the group or DIRECTOR. Percentages sum numerators and denominators (never the mean of percentages). `by_assignment` never mixes assignments.
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: Group indicators
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/analytics/overview:
+    get:
+      tags: [Analytics]
+      summary: One aggregated line per group
+      description: 'TUTOR: their groups; DIRECTOR: all.'
+      parameters:
+        - {name: academic_term_id, in: query, schema: {type: string, format: uuid}}
+        - {name: career_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {type: object, additionalProperties: true}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/analytics/alerts:
+    get:
+      tags: [Analytics]
+      summary: Persisted alerts within the caller's scope
+      description: |
+        Reads never recalculate: alerts are as fresh as the last `POST /alerts/recalculate` (see `evaluated_at`).
+        `status` empty = unresolved (OPEN + ACKNOWLEDGED); `ALL` = every status.
+      parameters:
+        - {name: student_id, in: query, schema: {type: string, format: uuid}}
+        - {name: group_id, in: query, schema: {type: string, format: uuid}}
+        - {name: academic_term_id, in: query, schema: {type: string, format: uuid}}
+        - {name: type, in: query, schema: {$ref: '#/components/schemas/AlertRule'}}
+        - {name: status, in: query, schema: {type: string, enum: [OPEN, ACKNOWLEDGED, RESOLVED, ALL]}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Offset'}
+      responses:
+        '200':
+          description: A page of alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/Alert'}}
+                  total: {type: integer}
+                  limit: {type: integer}
+                  offset: {type: integer}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/analytics/alerts/recalculate:
+    post:
+      tags: [Analytics]
+      summary: Re-evaluate the alert rules of ONE group
+      description: |
+        Tutor of the group or DIRECTOR, on demand only. One transaction with an advisory lock per group: creates new
+        conditions (OPEN), keeps current ones (ACKNOWLEDGED stays), refreshes message/evidence when they changed and
+        resolves the ones that no longer hold. Idempotent. A closed term is 409 `term_closed`. One audit event is
+        written only when something changed. Thresholds are MVP technical proposals, not institutional rules.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [group_id]
+              properties:
+                group_id: {type: string, format: uuid}
+                student_id: {type: string, format: uuid}
+      responses:
+        '200':
+          description: What the evaluation changed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  group_id: {type: string, format: uuid}
+                  student_id: {type: string, format: uuid, nullable: true}
+                  evaluated_at: {type: string, format: date-time}
+                  created: {type: integer}
+                  updated: {type: integer}
+                  resolved: {type: integer}
+                  unchanged: {type: integer}
+                  open_alerts: {type: object, additionalProperties: {type: integer}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+  /api/analytics/alerts/{id}:
+    get:
+      tags: [Analytics]
+      summary: Get one alert
+      parameters: [{$ref: '#/components/parameters/Id'}]
+      responses:
+        '200':
+          description: The alert
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Alert'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from `/api/auth/login` or `/api/auth/refresh`.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+      description: A non-UUID id answers 404, like an unknown one.
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Offset:
+      name: offset
+      in: query
+      schema: {type: integer, minimum: 0, default: 0}
+  responses:
+    BadRequest:
+      description: Malformed JSON/multipart or unknown field (`invalid_body`)
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Unauthorized:
+      description: Missing, invalid, expired or revoked token
+      headers:
+        WWW-Authenticate: {schema: {type: string, example: Bearer}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Forbidden:
+      description: Authenticated but not allowed (role or relationship), or `password_change_required`
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    NotFound:
+      description: Unknown resource or non-UUID id
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Conflict:
+      description: State conflict (term closed, duplicate, wrong stage...)
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    TooLarge:
+      description: Body or file too large
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    UnsupportedMedia:
+      description: Unsupported Content-Type or evidence type
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Unprocessable:
+      description: Validation error or unknown reference in the body
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    RateLimited:
+      description: Too many failed attempts
+      headers:
+        Retry-After: {schema: {type: integer}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    CareerList:
+      description: Careers
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: {type: array, items: {$ref: '#/components/schemas/Career'}}
+    AssignmentList:
+      description: Teaching assignments
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: {type: array, items: {$ref: '#/components/schemas/TeachingAssignment'}}
+    SubjectEnrollmentList:
+      description: Subject enrollments
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: {type: array, items: {$ref: '#/components/schemas/SubjectEnrollment'}}
+    ScheduleList:
+      description: Schedule slots
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: {type: array, items: {$ref: '#/components/schemas/Schedule'}}
+    FollowUpPage:
+      description: A page of follow-ups
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: {type: array, items: {$ref: '#/components/schemas/FollowUp'}}
+              total: {type: integer}
+              limit: {type: integer}
+              offset: {type: integer}
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, example: forbidden}
+            message: {type: string}
+            request_id: {type: string}
+      example: {error: {code: forbidden, message: you are not allowed to do this, request_id: 31900c5c12fbe1e9}}
+    Role:
+      type: string
+      enum: [ADMIN, DIRECTOR, TEACHER, TUTOR, STUDENT]
+    LoginRequest:
+      type: object
+      required: [institutional_number, password]
+      properties:
+        institutional_number: {type: string, pattern: '^[0-9]{8}$'}
+        password: {type: string}
+    User:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        institutional_number: {type: string}
+        email: {type: string}
+        first_name: {type: string}
+        last_name: {type: string}
+        roles: {type: array, items: {$ref: '#/components/schemas/Role'}}
+        must_change_password: {type: boolean}
+    AuthResult:
+      type: object
+      properties:
+        token_type: {type: string, enum: [Bearer]}
+        access_token: {type: string}
+        access_expires_at: {type: string, format: date-time}
+        refresh_token: {type: string}
+        refresh_expires_at: {type: string, format: date-time}
+        user: {$ref: '#/components/schemas/User'}
+    CreateUserRequest:
+      type: object
+      required: [institutional_number, first_name, last_name, password, roles]
+      properties:
+        institutional_number: {type: string, pattern: '^[0-9]{8}$'}
+        first_name: {type: string}
+        last_name: {type: string}
+        password: {type: string, minLength: 10}
+        roles: {type: array, minItems: 1, items: {$ref: '#/components/schemas/Role'}}
+    CodeNameRequest:
+      type: object
+      required: [code, name]
+      properties:
+        code: {type: string}
+        name: {type: string}
+    Career:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string}
+        name: {type: string}
+        is_active: {type: boolean}
+    Subject:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string}
+        name: {type: string}
+        is_active: {type: boolean}
+    SubjectUnit:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        subject_id: {type: string, format: uuid}
+        unit_number: {type: integer}
+        name: {type: string}
+    CurriculumEntry:
+      type: object
+      properties:
+        career_id: {type: string, format: uuid}
+        subject_id: {type: string, format: uuid}
+        level: {type: integer}
+        subject_code: {type: string}
+        subject_name: {type: string}
+    Term:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        start_date: {type: string, format: date}
+        end_date: {type: string, format: date}
+        status: {type: string, enum: [draft, active, closed]}
+    Group:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        academic_term_id: {type: string, format: uuid}
+        academic_term_name: {type: string}
+        career_id: {type: string, format: uuid}
+        career_code: {type: string}
+        career_name: {type: string}
+        tutor_id: {type: string, format: uuid, nullable: true}
+        code: {type: string}
+        level: {type: integer}
+    Person:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        institutional_number: {type: string}
+        first_name: {type: string}
+        last_name: {type: string}
+    Enrollment:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        group_id: {type: string, format: uuid}
+        student_id: {type: string, format: uuid}
+        status: {type: string, enum: [ACTIVE, WITHDRAWN]}
+        enrolled_at: {type: string, format: date-time}
+        student: {$ref: '#/components/schemas/Person'}
+    TeachingAssignment:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        group_id: {type: string, format: uuid}
+        group_code: {type: string}
+        subject_id: {type: string, format: uuid}
+        subject_code: {type: string}
+        subject_name: {type: string}
+        teacher_id: {type: string, format: uuid}
+        teacher_name: {type: string}
+    Schedule:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        teaching_assignment_id: {type: string, format: uuid}
+        day_of_week: {type: integer, minimum: 1, maximum: 7}
+        start_time: {type: string, example: '08:00'}
+        end_time: {type: string, example: '10:00'}
+        classroom: {type: string, nullable: true}
+    ScheduleDetail:
+      allOf:
+        - $ref: '#/components/schemas/Schedule'
+        - type: object
+          properties:
+            group_id: {type: string, format: uuid}
+            group_code: {type: string}
+            subject_code: {type: string}
+            subject_name: {type: string}
+            teacher_name: {type: string}
+    SubjectEnrollment:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        student_id: {type: string, format: uuid}
+        teaching_assignment_id: {type: string, format: uuid}
+        attempt_number: {type: integer}
+        status: {type: string, enum: [ACTIVE, WITHDRAWN]}
+        student: {$ref: '#/components/schemas/Person'}
+    CaptureGradeRequest:
+      type: object
+      required: [subject_enrollment_id, subject_unit_id, score]
+      properties:
+        subject_enrollment_id: {type: string, format: uuid}
+        subject_unit_id: {type: string, format: uuid}
+        score: {type: number, minimum: 0, maximum: 100, description: 'At most two decimals. 89.999, signs and exponents are rejected, never rounded.'}
+    GradeCategory:
+      type: string
+      enum: [NA, SA, DE, AU]
+      description: 'Derived from the exact score: <80.00 NA, 80.00-89.99 SA, 90.00-99.99 DE, 100.00 AU'
+    Grade:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        subject_enrollment_id: {type: string, format: uuid}
+        subject_unit_id: {type: string, format: uuid}
+        score: {type: number, example: 89.99}
+        category: {$ref: '#/components/schemas/GradeCategory'}
+        recorded_by: {type: string, format: uuid}
+        recorded_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    StudentSubjectGrades:
+      type: object
+      properties:
+        subject_enrollment_id: {type: string, format: uuid}
+        teaching_assignment_id: {type: string, format: uuid}
+        attempt_number: {type: integer}
+        status: {type: string}
+        academic_term: {type: object, properties: {id: {type: string, format: uuid}, name: {type: string}}}
+        group_code: {type: string}
+        subject: {type: object, properties: {id: {type: string, format: uuid}, code: {type: string}, name: {type: string}}}
+        units:
+          type: array
+          items:
+            type: object
+            properties:
+              subject_unit_id: {type: string, format: uuid}
+              unit_number: {type: integer}
+              unit_name: {type: string}
+              grade:
+                nullable: true
+                description: '`null` = not captured yet (never 0.00)'
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  score: {type: number}
+                  category: {$ref: '#/components/schemas/GradeCategory'}
+                  updated_at: {type: string, format: date-time}
+    AttendanceStatus:
+      type: string
+      enum: [PRESENT, LATE, ABSENT, JUSTIFIED]
+    AttendanceSession:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        teaching_assignment_id: {type: string, format: uuid}
+        schedule_id: {type: string, format: uuid, nullable: true}
+        session_date: {type: string, format: date}
+        status: {type: string, enum: [OPEN, CLOSED]}
+        opened_by: {type: string, format: uuid}
+        opened_at: {type: string, format: date-time}
+        closed_at: {type: string, format: date-time, nullable: true}
+        late_after_minutes: {type: integer}
+        lates_per_absence: {type: integer}
+    AttendanceRecord:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        attendance_session_id: {type: string, format: uuid}
+        subject_enrollment_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/AttendanceStatus'}
+        method: {type: string, enum: [QR, NFC, MANUAL]}
+        recorded_at: {type: string, format: date-time}
+        recorded_by: {type: string, format: uuid}
+    AttendanceCounts:
+      type: object
+      properties:
+        present: {type: integer}
+        late: {type: integer}
+        absent: {type: integer}
+        justified: {type: integer}
+    JustificationStatus:
+      type: string
+      enum: [PENDING_TUTOR, PENDING_TEACHER, TUTOR_REJECTED, TEACHER_REJECTED, JUSTIFIED]
+    JustificationRequestBody:
+      type: object
+      required: [attendance_record_id, reason]
+      properties:
+        attendance_record_id: {type: string, format: uuid}
+        reason: {type: string, minLength: 1, maxLength: 2000}
+    DecisionRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision: {type: string, enum: [APPROVED, REJECTED]}
+        comment: {type: string, description: Required when rejecting}
+    Justification:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        attendance_record_id: {type: string, format: uuid}
+        teaching_assignment_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/JustificationStatus'}
+        awaiting_stage: {type: string, enum: [TUTOR, TEACHER], nullable: true}
+        reason: {type: string}
+        student: {$ref: '#/components/schemas/Person'}
+        absence:
+          type: object
+          properties:
+            session_date: {type: string, format: date}
+            attendance_status: {$ref: '#/components/schemas/AttendanceStatus'}
+            group_code: {type: string}
+            subject: {type: object, properties: {code: {type: string}, name: {type: string}}}
+            academic_term: {type: string}
+        evidence_count: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              original_filename: {type: string}
+              mime_type: {type: string, enum: [application/pdf, image/jpeg, image/png]}
+              size_bytes: {type: integer}
+              created_at: {type: string, format: date-time}
+        reviews:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string, format: uuid}
+              stage: {type: string, enum: [TUTOR, TEACHER]}
+              decision: {type: string, enum: [APPROVED, REJECTED]}
+              comment: {type: string}
+              reviewer: {type: object, properties: {id: {type: string, format: uuid}, name: {type: string}}}
+              reviewed_at: {type: string, format: date-time}
+    FollowUp:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        student: {$ref: '#/components/schemas/Person'}
+        group: {type: object, properties: {id: {type: string, format: uuid}, code: {type: string}}}
+        academic_term: {type: object, properties: {id: {type: string, format: uuid}, name: {type: string}}}
+        author: {type: object, properties: {id: {type: string, format: uuid}, name: {type: string}}}
+        followup_date: {type: string, format: date}
+        note: {type: string}
+        created_at: {type: string, format: date-time}
+    AlertRule:
+      type: string
+      enum: [GRADE_NA_UNIT, UNJUSTIFIED_ABSENCES, ATTENDANCE_DROP, PENDING_JUSTIFICATIONS]
+      description: Rule codes. Thresholds are configurable MVP proposals, not institutional rules.
+    Alert:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        rule: {$ref: '#/components/schemas/AlertRule'}
+        rule_description: {type: string}
+        status: {type: string, enum: [OPEN, ACKNOWLEDGED, RESOLVED]}
+        message: {type: string}
+        evidence: {type: object, additionalProperties: true, description: Objective figures and the threshold applied}
+        student: {$ref: '#/components/schemas/Person'}
+        group: {type: object, properties: {id: {type: string, format: uuid}, code: {type: string}}}
+        academic_term: {type: object, properties: {id: {type: string, format: uuid}, name: {type: string}}}
+        subject:
+          nullable: true
+          type: object
+          properties:
+            subject_enrollment_id: {type: string, format: uuid}
+            code: {type: string}
+            name: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        evaluated_at: {type: string, format: date-time}
+        resolved_at: {type: string, format: date-time, nullable: true}
+    StudentAnalytics:
+      type: object
+      properties:
+        group: {type: object, additionalProperties: true}
+        career: {type: object, additionalProperties: true}
+        academic_term: {type: object, additionalProperties: true}
+        student: {$ref: '#/components/schemas/Person'}
+        enrollment_status: {type: string}
+        subjects:
+          type: array
+          items:
+            type: object
+            properties:
+              subject_enrollment_id: {type: string, format: uuid}
+              teaching_assignment_id: {type: string, format: uuid}
+              subject: {type: object, properties: {code: {type: string}, name: {type: string}}}
+              attempt_number: {type: integer}
+              status: {type: string}
+              grades:
+                type: object
+                properties:
+                  units_total: {type: integer}
+                  units_graded: {type: integer}
+                  units_pending: {type: integer, description: Not captured yet; neither NA nor 0.00}
+                  na: {type: integer}
+                  sa: {type: integer}
+                  de: {type: integer}
+                  au: {type: integer}
+                  na_units: {type: array, items: {type: object, additionalProperties: true}}
+              attendance:
+                type: object
+                properties:
+                  closed_session_records: {type: integer}
+                  present: {type: integer}
+                  late: {type: integer}
+                  absent: {type: integer}
+                  justified: {type: integer}
+                  unjustified_absences: {type: integer}
+                  attendance_pct:
+                    type: number
+                    nullable: true
+                    description: 'Attendance adjusted by justifications: (present+late)/(present+late+absent), JUSTIFIED out of the denominator; null when there is no denominator'
+                  lates_per_absence: {type: integer, nullable: true}
+                  absences_from_lates: {type: integer}
+                  effective_absences: {type: integer}
+              attendance_trend: {type: object, nullable: true, additionalProperties: true}
+              justifications: {type: object, additionalProperties: true}
+        totals: {type: object, additionalProperties: true}
+        tutoring:
+          type: object
+          properties:
+            followups_count: {type: integer}
+            last_followup_date: {type: string, format: date, nullable: true}
+        signals:
+          type: array
+          description: Alert rules evaluated now (live)
+          items: {type: object, additionalProperties: true}
+        alerts:
+          type: array
+          description: Persisted alerts as of the last recalculation
+          items: {$ref: '#/components/schemas/Alert'}
