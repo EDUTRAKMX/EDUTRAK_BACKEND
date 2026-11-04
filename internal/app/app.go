@@ -33,6 +33,9 @@ import (
 	"github.com/edutrak/backend/internal/platform/config"
 	"github.com/edutrak/backend/internal/platform/database"
 	"github.com/edutrak/backend/internal/platform/httpx"
+	tutoringhttp "github.com/edutrak/backend/internal/tutoring/adapters/http"
+	tutoringpg "github.com/edutrak/backend/internal/tutoring/adapters/postgres"
+	tutoringapp "github.com/edutrak/backend/internal/tutoring/application"
 	"github.com/google/uuid"
 )
 
@@ -140,6 +143,20 @@ func NewJustificationsService(db *database.DB, cfg config.Config, log *slog.Logg
 	}), nil
 }
 
+// NewTutoringService builds the tutoring use cases. Academic, Grades, Attendance and
+// Justifications data are read through the overview reader; nothing is duplicated.
+func NewTutoringService(db *database.DB, cfg config.Config) *tutoringapp.Service {
+	return tutoringapp.NewService(tutoringapp.Deps{
+		Repo:      tutoringpg.NewRepository(db),
+		Overviews: tutoringpg.NewOverviewReader(db),
+		Audit:     auditpg.NewRecorder(db),
+		Tx:        db,
+		Clock:     systemClock{},
+		NewID:     uuid.New,
+		Location:  cfg.InstitutionLocation,
+	})
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -169,5 +186,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	}
 	justhttp.NewHandler(justifications, identity, maxEvidenceBytes(cfg)).Register(mux)
 	attendancehttp.NewHandler(NewAttendanceService(db, cfg), identity, cfg.TrustedProxies).Register(mux)
+	tutoringhttp.NewHandler(NewTutoringService(db, cfg), identity).Register(mux)
 	return httpx.Base(log, mux), nil
 }
