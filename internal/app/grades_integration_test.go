@@ -10,6 +10,7 @@ import (
 	gradespg "github.com/edutrak/backend/internal/grades/adapters/postgres"
 	gradesapp "github.com/edutrak/backend/internal/grades/application"
 	"github.com/edutrak/backend/internal/identity/domain"
+	"github.com/edutrak/backend/internal/platform/config"
 	"github.com/google/uuid"
 )
 
@@ -27,9 +28,11 @@ type gradeFx struct {
 	foreignUnit    string // a unit of FIS1 (belongs to another subject than assignment)
 }
 
-func newGradeFx(t *testing.T) *gradeFx {
+func newGradeFx(t *testing.T) *gradeFx { return newGradeFxWith(t, nil) }
+
+func newGradeFxWith(t *testing.T, mutate func(*config.Config)) *gradeFx {
 	t.Helper()
-	w := newWorld(t)
+	w := newWorldWith(t, mutate)
 	career, subject, term := w.seedPlan() // MAT1 has units 1 and 2, level 2
 	for n := 3; n <= 7; n++ {
 		w.must("director", "POST", "/api/academic/subjects/"+subject+"/units", fmt.Sprintf(`{"unit_number":%d,"name":"Unidad %d"}`, n, n), 201)

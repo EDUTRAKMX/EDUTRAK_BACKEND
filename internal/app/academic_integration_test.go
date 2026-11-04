@@ -35,12 +35,18 @@ type world struct {
 	token map[string]string // account key -> access token
 }
 
-func newWorld(t *testing.T) *world {
+func newWorld(t *testing.T) *world { return newWorldWith(t, nil) }
+
+// newWorldWith lets a test adjust the configuration (networks, proxies...) before the handler is built.
+func newWorldWith(t *testing.T, mutate func(*config.Config)) *world {
 	t.Helper()
 	db := dbtest.New(t)
 	cfg := config.Config{
 		JWTSecret: []byte("0123456789abcdef0123456789abcdef"), AccessTokenTTL: 15 * time.Minute, RefreshTokenTTL: time.Hour,
 		LoginMaxFailuresPerAccount: 5, LoginMaxFailuresPerIP: 150, LoginRateWindow: 15 * time.Minute,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	idsvc, err := app.NewIdentityService(db, cfg)
 	if err != nil {

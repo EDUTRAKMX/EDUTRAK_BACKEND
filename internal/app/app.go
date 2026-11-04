@@ -11,6 +11,11 @@ import (
 	acadhttp "github.com/edutrak/backend/internal/academic/adapters/http"
 	acadpg "github.com/edutrak/backend/internal/academic/adapters/postgres"
 	acadapp "github.com/edutrak/backend/internal/academic/application"
+	attendancehttp "github.com/edutrak/backend/internal/attendance/adapters/http"
+	attendancenet "github.com/edutrak/backend/internal/attendance/adapters/network"
+	attendancepg "github.com/edutrak/backend/internal/attendance/adapters/postgres"
+	attendancesec "github.com/edutrak/backend/internal/attendance/adapters/security"
+	attendanceapp "github.com/edutrak/backend/internal/attendance/application"
 	auditpg "github.com/edutrak/backend/internal/audit/adapters/postgres"
 	gradeshttp "github.com/edutrak/backend/internal/grades/adapters/http"
 	gradespg "github.com/edutrak/backend/internal/grades/adapters/postgres"
@@ -80,6 +85,27 @@ func NewGradesService(db *database.DB) *gradesapp.Service {
 	})
 }
 
+// NewAttendanceService builds the attendance use cases on top of PostgreSQL.
+// The QR network check allows only the configured institutional networks; the
+// "allow any" switch is ignored in production even if it somehow reached here.
+func NewAttendanceService(db *database.DB, cfg config.Config) *attendanceapp.Service {
+	allowAny := cfg.AttendanceAllowAnyNetwork && cfg.Env != "production"
+	return attendanceapp.NewService(attendanceapp.Deps{
+		Repo:                    attendancepg.NewRepository(db),
+		Academic:                attendancepg.NewAcademicReader(db),
+		Tokens:                  attendancesec.NewQRTokens(),
+		Network:                 attendancenet.New(cfg.AllowedNetworks, allowAny),
+		Clock:                   systemClock{},
+		Audit:                   auditpg.NewRecorder(db),
+		Tx:                      db,
+		NewID:                   uuid.New,
+		QRTTL:                   cfg.QRTokenTTL,
+		DefaultLateAfterMinutes: cfg.AttendanceLateAfterMinutes,
+		DefaultLatesPerAbsence:  cfg.AttendanceLatesPerAbsence,
+		Location:                cfg.InstitutionLocation,
+	})
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -103,5 +129,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	idhttp.NewHandler(identity, cfg.TrustedProxies).Register(mux)
 	acadhttp.NewHandler(NewAcademicService(db), identity).Register(mux)
 	gradeshttp.NewHandler(NewGradesService(db), identity).Register(mux)
+	attendancehttp.NewHandler(NewAttendanceService(db, cfg), identity, cfg.TrustedProxies).Register(mux)
 	return httpx.Base(log, mux), nil
 }

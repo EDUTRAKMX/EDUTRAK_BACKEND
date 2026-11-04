@@ -633,3 +633,70 @@ func TestGradesTableMatchesDictionary(t *testing.T) {
 		t.Fatal("UNIQUE (subject_enrollment_id, subject_unit_id) is missing")
 	}
 }
+
+// TestMigration0009AddsAttendanceIntegrityWithoutLosingData upgrades a database that
+// already holds attendance data (schema 0008) and checks the new rules.
+func TestMigration0009AddsAttendanceIntegrityWithoutLosingData(t *testing.T) {
+	db := dbtest.NewEmpty(t)
+	ctx := context.Background()
+	old := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_identity.sql", "0002_academic.sql", "0003_grades_attendance.sql", "0004_justifications_tutoring_analytics_audit.sql",
+		"0005_dictionary_alignment_and_session_revocation.sql", "0006_level_columns.sql", "0007_academic_dictionary_alignment.sql",
+		"0008_grades_dictionary_alignment.sql",
+	} {
+		body, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old[name] = &fstest.MapFile{Data: body}
+	}
+	if err := db.Migrate(ctx, old, discardLogger()); err != nil {
+		t.Fatalf("migrate to 0008: %v", err)
+	}
+
+	teacher, student := insertUser(t, db, "30000019"), insertUser(t, db, "40000019")
+	career, term, subject, group, assignment, se := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO careers (id, code, name) VALUES ($1, 'TIC', 'Tecnologias')`, career)
+	mustExec(t, db, `INSERT INTO academic_terms (id, name, start_date, end_date) VALUES ($1, '2026-1', '2026-01-05', '2026-04-30')`, term)
+	mustExec(t, db, `INSERT INTO subjects (id, code, name) VALUES ($1, 'MAT1', 'Matematicas')`, subject)
+	mustExec(t, db, `INSERT INTO groups (id, career_id, academic_term_id, code, level) VALUES ($1, $2, $3, 'A1', 1)`, group, career, term)
+	mustExec(t, db, `INSERT INTO teaching_assignments (id, group_id, subject_id, teacher_id) VALUES ($1, $2, $3, $4)`, assignment, group, subject, teacher)
+	mustExec(t, db, `INSERT INTO subject_enrollments (id, student_id, teaching_assignment_id) VALUES ($1, $2, $3)`, se, student, assignment)
+	closed, open, rec := uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, status, opened_by, closed_at) VALUES ($1, $2, '2026-02-02', 'CLOSED', $3, now())`, closed, assignment, teacher)
+	mustExec(t, db, `INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, opened_by) VALUES ($1, $2, '2026-02-03', $3)`, open, assignment, teacher)
+	mustExec(t, db, `INSERT INTO attendance_records (id, attendance_session_id, subject_enrollment_id, status, method, recorded_by) VALUES ($1, $2, $3, 'LATE', 'QR', $4)`, rec, closed, se, student)
+
+	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
+		t.Fatalf("upgrade to latest: %v", err)
+	}
+
+	var sessions, records int
+	var status string
+	_ = db.Q(ctx).QueryRow(ctx, `SELECT count(*) FROM attendance_sessions`).Scan(&sessions)
+	_ = db.Q(ctx).QueryRow(ctx, `SELECT count(*), max(status) FROM attendance_records`).Scan(&records, &status)
+	if sessions != 2 || records != 1 || status != "LATE" {
+		t.Fatalf("data after upgrade: %d sessions, %d records, status %q", sessions, records, status)
+	}
+	// the existing OPEN session now blocks a second one for the same assignment, but not another assignment's
+	if err := execErr(db, `INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, opened_by) VALUES ($1, $2, '2026-02-04', $3)`, uuid.New(), assignment, teacher); err == nil {
+		t.Fatal("a second OPEN session for the assignment must be rejected")
+	}
+	if err := execErr(db, `INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, status, opened_by, closed_at) VALUES ($1, $2, '2026-02-05', 'CLOSED', $3, now())`, uuid.New(), assignment, teacher); err != nil {
+		t.Fatalf("CLOSED sessions are unlimited: %v", err)
+	}
+	// QR state rules
+	if err := execErr(db, `UPDATE attendance_sessions SET qr_token_hash = $2 WHERE id = $1`, open, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("a QR hash without an expiry must be rejected")
+	}
+	if err := execErr(db, `UPDATE attendance_sessions SET qr_token_hash = $2, qr_expires_at = now() + interval '30 seconds' WHERE id = $1`, open, strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("hash + expiry together: %v", err)
+	}
+	if err := execErr(db, `UPDATE attendance_sessions SET status = 'CLOSED', closed_at = now() WHERE id = $1`, open); err == nil {
+		t.Fatal("closing without clearing the QR must be rejected")
+	}
+	if err := execErr(db, `UPDATE attendance_sessions SET status = 'CLOSED', closed_at = now(), qr_token_hash = NULL, qr_expires_at = NULL WHERE id = $1`, open); err != nil {
+		t.Fatalf("closing with the QR cleared: %v", err)
+	}
+}
