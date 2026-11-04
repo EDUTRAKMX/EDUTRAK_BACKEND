@@ -700,3 +700,74 @@ func TestMigration0009AddsAttendanceIntegrityWithoutLosingData(t *testing.T) {
 		t.Fatalf("closing with the QR cleared: %v", err)
 	}
 }
+
+// TestMigration0010HardensJustificationsWithoutLosingData upgrades a database that already
+// holds a request, its evidence and its reviews (schema 0009).
+func TestMigration0010HardensJustificationsWithoutLosingData(t *testing.T) {
+	db := dbtest.NewEmpty(t)
+	ctx := context.Background()
+	old := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_identity.sql", "0002_academic.sql", "0003_grades_attendance.sql", "0004_justifications_tutoring_analytics_audit.sql",
+		"0005_dictionary_alignment_and_session_revocation.sql", "0006_level_columns.sql", "0007_academic_dictionary_alignment.sql",
+		"0008_grades_dictionary_alignment.sql", "0009_attendance_integrity.sql",
+	} {
+		body, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old[name] = &fstest.MapFile{Data: body}
+	}
+	if err := db.Migrate(ctx, old, discardLogger()); err != nil {
+		t.Fatalf("migrate to 0009: %v", err)
+	}
+	teacher, student, tutor := insertUser(t, db, "30000029"), insertUser(t, db, "40000029"), insertUser(t, db, "50000029")
+	career, term, subject, group, assignment, se := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO careers (id, code, name) VALUES ($1, 'TIC', 'Tecnologias')`, career)
+	mustExec(t, db, `INSERT INTO academic_terms (id, name, start_date, end_date) VALUES ($1, '2026-1', '2026-01-05', '2026-04-30')`, term)
+	mustExec(t, db, `INSERT INTO subjects (id, code, name) VALUES ($1, 'MAT1', 'Matematicas')`, subject)
+	mustExec(t, db, `INSERT INTO groups (id, career_id, academic_term_id, code, level, tutor_id) VALUES ($1, $2, $3, 'A1', 1, $4)`, group, career, term, tutor)
+	mustExec(t, db, `INSERT INTO teaching_assignments (id, group_id, subject_id, teacher_id) VALUES ($1, $2, $3, $4)`, assignment, group, subject, teacher)
+	mustExec(t, db, `INSERT INTO subject_enrollments (id, student_id, teaching_assignment_id) VALUES ($1, $2, $3)`, se, student, assignment)
+	sess, rec, req, ev, rv := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(t, db, `INSERT INTO attendance_sessions (id, teaching_assignment_id, session_date, status, opened_by, closed_at) VALUES ($1, $2, '2026-02-02', 'CLOSED', $3, now())`, sess, assignment, teacher)
+	mustExec(t, db, `INSERT INTO attendance_records (id, attendance_session_id, subject_enrollment_id, status, method, recorded_by) VALUES ($1, $2, $3, 'ABSENT', 'MANUAL', $4)`, rec, sess, se, teacher)
+	mustExec(t, db, `INSERT INTO justification_requests (id, attendance_record_id, student_id, reason, status) VALUES ($1, $2, $3, 'Consulta', 'PENDING_TEACHER')`, req, rec, student)
+	mustExec(t, db, `INSERT INTO justification_evidence (id, justification_request_id, storage_key, original_filename, mime_type, size_bytes) VALUES ($1, $2, 'ab/abcdef0123456789abcdef0123456789.pdf', 'c.pdf', 'application/pdf', 1000)`, ev, req)
+	mustExec(t, db, `INSERT INTO justification_reviews (id, justification_request_id, reviewer_id, stage, decision) VALUES ($1, $2, $3, 'TUTOR', 'APPROVED')`, rv, req, tutor)
+
+	if err := db.Migrate(ctx, migrations.FS, discardLogger()); err != nil {
+		t.Fatalf("upgrade to latest: %v", err)
+	}
+
+	var status, decision, key string
+	var reviews, evidence int
+	_ = db.Q(ctx).QueryRow(ctx, `SELECT status FROM justification_requests WHERE id = $1`, req).Scan(&status)
+	_ = db.Q(ctx).QueryRow(ctx, `SELECT count(*), max(decision) FROM justification_reviews`).Scan(&reviews, &decision)
+	_ = db.Q(ctx).QueryRow(ctx, `SELECT count(*), max(storage_key) FROM justification_evidence`).Scan(&evidence, &key)
+	if status != "PENDING_TEACHER" || reviews != 1 || decision != "APPROVED" || evidence != 1 || key != "ab/abcdef0123456789abcdef0123456789.pdf" {
+		t.Fatalf("data after upgrade: %s / %d reviews %s / %d evidence %s", status, reviews, decision, evidence, key)
+	}
+	insRv := `INSERT INTO justification_reviews (id, justification_request_id, reviewer_id, stage, decision, comment) VALUES ($1, $2, $3, $4, $5, $6)`
+	if err := execErr(db, insRv, uuid.New(), req, tutor, "TUTOR", "APPROVED", nil); err == nil {
+		t.Fatal("a second TUTOR review must be rejected (one per stage)")
+	}
+	if err := execErr(db, insRv, uuid.New(), req, teacher, "TEACHER", "REJECTED", nil); err == nil {
+		t.Fatal("a rejection without comment must be rejected")
+	}
+	if err := execErr(db, insRv, uuid.New(), req, teacher, "TEACHER", "REJECTED", "  \n\t "); err == nil {
+		t.Fatal("a whitespace-only comment must be rejected")
+	}
+	if err := execErr(db, `UPDATE justification_reviews SET decision = 'REJECTED', comment = 'x' WHERE id = $1`, rv); err == nil {
+		t.Fatal("reviews are append-only: UPDATE must fail")
+	}
+	if err := execErr(db, `DELETE FROM justification_reviews WHERE id = $1`, rv); err == nil {
+		t.Fatal("reviews are append-only: DELETE must fail")
+	}
+	if err := execErr(db, `UPDATE justification_requests SET reason = E' \n\t' WHERE id = $1`, req); err == nil {
+		t.Fatal("a blank reason must be rejected")
+	}
+	if err := execErr(db, insRv, uuid.New(), req, teacher, "TEACHER", "APPROVED", nil); err != nil {
+		t.Fatalf("the teacher's approval needs no comment: %v", err)
+	}
+}

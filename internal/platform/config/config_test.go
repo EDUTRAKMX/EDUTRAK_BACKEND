@@ -117,7 +117,8 @@ func TestAttendanceDefaults(t *testing.T) {
 }
 
 func TestAttendanceConfigValidation(t *testing.T) {
-	prod := func(m map[string]string) { m["APP_ENV"] = "production" }
+	abs, _ := filepath.Abs(".") // an absolute path on any OS
+	prod := func(m map[string]string) { m["APP_ENV"] = "production"; m["STORAGE_DIR"] = abs }
 	tests := []struct {
 		name   string
 		mutate func(map[string]string)
@@ -154,5 +155,43 @@ func TestAttendanceConfigValidation(t *testing.T) {
 				t.Fatalf("want error containing %q, got %v", tt.want, err)
 			}
 		})
+	}
+}
+
+func TestJustificationAndStorageConfig(t *testing.T) {
+	cfg, err := Load(env(validEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JustificationEvidenceRequired || cfg.MaxEvidenceMB != 10 || cfg.StorageDir == "" {
+		t.Fatalf("defaults: %+v", cfg)
+	}
+	abs, _ := filepath.Abs(".")
+	prodBase := func() map[string]string {
+		m := validEnv()
+		m["APP_ENV"], m["ALLOWED_NETWORKS"] = "production", "192.0.2.0/24"
+		return m
+	}
+	m := prodBase()
+	if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), "STORAGE_DIR") {
+		t.Fatalf("production without STORAGE_DIR must fail, got %v", err)
+	}
+	m["STORAGE_DIR"] = "relative/dir"
+	if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), "STORAGE_DIR") {
+		t.Fatalf("production with a relative STORAGE_DIR must fail, got %v", err)
+	}
+	m["STORAGE_DIR"] = abs
+	if _, err := Load(env(m)); err != nil {
+		t.Fatalf("production with an absolute STORAGE_DIR: %v", err)
+	}
+	bad := validEnv()
+	bad["JUSTIFICATION_EVIDENCE_REQUIRED"] = "sometimes"
+	if _, err := Load(env(bad)); err == nil {
+		t.Fatal("invalid boolean must fail")
+	}
+	ok := validEnv()
+	ok["JUSTIFICATION_EVIDENCE_REQUIRED"] = "true"
+	if c, err := Load(env(ok)); err != nil || !c.JustificationEvidenceRequired {
+		t.Fatalf("%v %+v", err, c)
 	}
 }

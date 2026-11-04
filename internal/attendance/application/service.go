@@ -502,3 +502,28 @@ func (s *Service) GetStudentAttendance(ctx context.Context, p iddomain.Principal
 	}
 	return s.Repo.StudentAttendance(ctx, studentID, scope)
 }
+
+// --- internal API for the justification flow --------------------------------------------------
+//
+// Justifications never writes attendance tables itself. These two methods are the ONLY way a
+// record becomes JUSTIFIED. They have no HTTP endpoint and take no principal: the caller (the
+// justification use cases) has already authorized the human decision. They must run inside the
+// caller's transaction (the repository joins it through the context).
+
+// AbsenceForJustification loads (and, with lock, row-locks) a record with its academic context.
+func (s *Service) AbsenceForJustification(ctx context.Context, recordID uuid.UUID, lock bool) (*domain.AbsenceRef, error) {
+	return s.Repo.GetAbsence(ctx, recordID, lock)
+}
+
+// JustifyAbsence turns an ABSENT record into JUSTIFIED. It refuses (ErrAbsenceNotEligible) any
+// other current status, so a concurrent correction can never be overwritten.
+func (s *Service) JustifyAbsence(ctx context.Context, recordID uuid.UUID) error {
+	changed, err := s.Repo.JustifyRecord(ctx, recordID)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return domain.ErrAbsenceNotEligible
+	}
+	return nil
+}

@@ -16,6 +16,8 @@ const (
 	KindNotFound
 	KindConflict
 	KindRateLimited
+	KindPayloadTooLarge  // 413
+	KindUnsupportedMedia // 415
 )
 
 // Error is an expected (non-infrastructure) failure. Code is a stable,

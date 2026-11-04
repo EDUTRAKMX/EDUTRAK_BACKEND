@@ -39,6 +39,7 @@ var (
 	ErrAlreadyRegistered  = conflict("attendance_already_registered", "attendance is already registered for this student in this session")
 	ErrTermClosed         = conflict("term_closed", "the academic term is closed")
 	ErrEnrollmentInactive = conflict("subject_enrollment_inactive", "the subject enrollment is not active")
+	ErrAbsenceNotEligible = conflict("absence_not_eligible", "the attendance record is not an ABSENT record that can be justified")
 	ErrRecordJustified    = conflict("record_justified", "a justified record cannot be changed here; it belongs to the justification flow")
 
 	ErrNetworkNotAllowed = forbidden("network_not_allowed", "attendance can only be registered from the institutional network")
@@ -201,6 +202,23 @@ func (a AssignmentRef) RequireOpenTerm() error {
 		return ErrTermClosed
 	}
 	return nil
+}
+
+// AbsenceRef describes an attendance record together with the academic context the
+// justification flow needs to authorize and validate a request. It is internal: it is
+// never serialized by this module's HTTP adapter.
+type AbsenceRef struct {
+	RecordID            uuid.UUID
+	Status              RecordStatus
+	SessionID           uuid.UUID
+	SessionDate         time.Time
+	SubjectEnrollmentID uuid.UUID
+	EnrollmentStatus    string
+	StudentID           uuid.UUID
+	AssignmentID        uuid.UUID
+	TeacherID           uuid.UUID
+	GroupTutorID        *uuid.UUID
+	TermStatus          string
 }
 
 // EnrollmentRef is a subject enrollment as attendance sees it.

@@ -63,3 +63,22 @@ func TestDecodeJSONRejectsUnknownFields(t *testing.T) {
 		t.Fatal("expected error for unknown field")
 	}
 }
+
+func TestPayloadTooLargeAndUnsupportedMediaMapping(t *testing.T) {
+	for _, tt := range []struct {
+		err  error
+		want int
+	}{
+		{apperr.New(apperr.KindPayloadTooLarge, "evidence_too_large", "too big"), http.StatusRequestEntityTooLarge},
+		{apperr.New(apperr.KindUnsupportedMedia, "unsupported_evidence_type", "bad type"), http.StatusUnsupportedMediaType},
+	} {
+		rec := httptest.NewRecorder()
+		Error(rec, httptest.NewRequest("POST", "/", nil), tt.err)
+		if rec.Code != tt.want {
+			t.Errorf("%v -> %d, want %d", tt.err, rec.Code, tt.want)
+		}
+		if !strings.Contains(rec.Body.String(), `"code"`) {
+			t.Errorf("body = %s", rec.Body.String())
+		}
+	}
+}

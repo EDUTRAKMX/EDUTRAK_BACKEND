@@ -42,6 +42,12 @@ type Repository interface {
 	GetRecord(ctx context.Context, id uuid.UUID, forUpdate bool) (*domain.Record, error) // domain.ErrRecordNotFound
 	UpdateRecordStatus(ctx context.Context, id uuid.UUID, status domain.RecordStatus) (*domain.Record, error)
 
+	// GetAbsence loads a record with its academic context. With lock the record row is held
+	// FOR UPDATE until the transaction ends (used by the justification flow).
+	GetAbsence(ctx context.Context, recordID uuid.UUID, lock bool) (*domain.AbsenceRef, error) // domain.ErrRecordNotFound
+	// JustifyRecord sets ABSENT -> JUSTIFIED and reports whether a row changed.
+	JustifyRecord(ctx context.Context, recordID uuid.UUID) (bool, error)
+
 	SessionDetail(ctx context.Context, sessionID uuid.UUID) (*domain.SessionDetail, error)
 	AssignmentOverview(ctx context.Context, assignmentID uuid.UUID) (*domain.AssignmentOverview, error)
 	StudentAttendance(ctx context.Context, studentID uuid.UUID, scope ViewScope) ([]domain.StudentAttendance, error)

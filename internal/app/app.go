@@ -25,6 +25,11 @@ import (
 	idratelimit "github.com/edutrak/backend/internal/identity/adapters/ratelimit"
 	idsecurity "github.com/edutrak/backend/internal/identity/adapters/security"
 	idapp "github.com/edutrak/backend/internal/identity/application"
+	justattendance "github.com/edutrak/backend/internal/justifications/adapters/attendance"
+	justhttp "github.com/edutrak/backend/internal/justifications/adapters/http"
+	justpg "github.com/edutrak/backend/internal/justifications/adapters/postgres"
+	juststorage "github.com/edutrak/backend/internal/justifications/adapters/storage"
+	justapp "github.com/edutrak/backend/internal/justifications/application"
 	"github.com/edutrak/backend/internal/platform/config"
 	"github.com/edutrak/backend/internal/platform/database"
 	"github.com/edutrak/backend/internal/platform/httpx"
@@ -106,6 +111,35 @@ func NewAttendanceService(db *database.DB, cfg config.Config) *attendanceapp.Ser
 	})
 }
 
+// maxEvidenceBytes is the per-file limit (MAX_EVIDENCE_MB, at most 10 MiB; 10 when unset).
+func maxEvidenceBytes(cfg config.Config) int64 {
+	if cfg.MaxEvidenceMB < 1 || cfg.MaxEvidenceMB > 10 {
+		return 10 << 20
+	}
+	return int64(cfg.MaxEvidenceMB) << 20
+}
+
+// NewJustificationsService builds the justification use cases. Evidence goes to the private
+// directory STORAGE_DIR; the only write into attendance data is the Attendance module's own
+// JustifyAbsence use case, reached through the gateway.
+func NewJustificationsService(db *database.DB, cfg config.Config, log *slog.Logger) (*justapp.Service, error) {
+	store, err := juststorage.New(cfg.StorageDir)
+	if err != nil {
+		return nil, err
+	}
+	return justapp.NewService(justapp.Deps{
+		Repo:             justpg.NewRepository(db),
+		Attendance:       justattendance.NewGateway(NewAttendanceService(db, cfg)),
+		Storage:          store,
+		Audit:            auditpg.NewRecorder(db),
+		Tx:               db,
+		NewID:            uuid.New,
+		Log:              log,
+		MaxEvidenceBytes: maxEvidenceBytes(cfg),
+		EvidenceRequired: cfg.JustificationEvidenceRequired,
+	}), nil
+}
+
 // NewHTTPHandler returns the full API handler.
 func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.Handler, error) {
 	identity, err := NewIdentityService(db, cfg)
@@ -129,6 +163,11 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	idhttp.NewHandler(identity, cfg.TrustedProxies).Register(mux)
 	acadhttp.NewHandler(NewAcademicService(db), identity).Register(mux)
 	gradeshttp.NewHandler(NewGradesService(db), identity).Register(mux)
+	justifications, err := NewJustificationsService(db, cfg, log)
+	if err != nil {
+		return nil, err
+	}
+	justhttp.NewHandler(justifications, identity, maxEvidenceBytes(cfg)).Register(mux)
 	attendancehttp.NewHandler(NewAttendanceService(db, cfg), identity, cfg.TrustedProxies).Register(mux)
 	return httpx.Base(log, mux), nil
 }
