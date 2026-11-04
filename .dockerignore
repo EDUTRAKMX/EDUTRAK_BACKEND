@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+!.env.example
+data
+tmp
+coverage.out
+*.test
+*.exe
+CLAUDE.md

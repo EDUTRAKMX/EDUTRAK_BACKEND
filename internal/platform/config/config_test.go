@@ -15,7 +15,7 @@ func env(m map[string]string) func(string) string {
 func validEnv() map[string]string {
 	return map[string]string{
 		"DATABASE_URL": "postgres://u:p@localhost:5432/db",
-		"JWT_SECRET":   strings.Repeat("x", 32),
+		"JWT_SECRET":   "k3Zp9Qv1Lm8Xt4Rw7Yb2Nc6Hd5Gf0Ja!", // fictitious but not a placeholder
 	}
 }
 
@@ -202,5 +202,59 @@ func TestJustificationAndStorageConfig(t *testing.T) {
 	ok["JUSTIFICATION_EVIDENCE_REQUIRED"] = "true"
 	if c, err := Load(env(ok)); err != nil || !c.JustificationEvidenceRequired {
 		t.Fatalf("%v %+v", err, c)
+	}
+}
+
+func TestCORSOriginsConfig(t *testing.T) {
+	m := validEnv()
+	m["CORS_ALLOWED_ORIGINS"] = "https://app.example.edu, http://localhost:5173"
+	cfg, err := Load(env(m))
+	if err != nil || len(cfg.CORSAllowedOrigins) != 2 || cfg.CORSAllowedOrigins[0] != "https://app.example.edu" {
+		t.Fatalf("origins: %v %v", cfg.CORSAllowedOrigins, err)
+	}
+	if cfg, _ := Load(env(validEnv())); len(cfg.CORSAllowedOrigins) != 0 {
+		t.Fatal("CORS must be off by default")
+	}
+	for _, bad := range []string{"*", "https://app.example.edu/", "app.example.edu", "https://a.edu/x"} {
+		m := validEnv()
+		m["CORS_ALLOWED_ORIGINS"] = bad
+		if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), "CORS_ALLOWED_ORIGINS") {
+			t.Errorf("%q should be rejected, got %v", bad, err)
+		}
+	}
+}
+
+func TestProductionRejectsExampleSecrets(t *testing.T) {
+	prod := func() map[string]string {
+		m := validEnv()
+		m["APP_ENV"] = "production"
+		m["ALLOWED_NETWORKS"] = "192.0.2.0/24"
+		m["STORAGE_DIR"] = filepath.Join(t.TempDir(), "evidence")
+		return m
+	}
+	if _, err := Load(env(prod())); err != nil {
+		t.Fatalf("a real-looking production config must load: %v", err)
+	}
+	cases := map[string]func(map[string]string){
+		"change-me secret":   func(m map[string]string) { m["JWT_SECRET"] = "change-me-change-me-change-me-change-me" },
+		"repeated character": func(m map[string]string) { m["JWT_SECRET"] = strings.Repeat("a", 40) },
+		"dev database secret": func(m map[string]string) {
+			m["DATABASE_URL"] = "postgres://edutrak:edutrak_dev_password@db:5432/edutrak"
+		},
+		"plain http origin": func(m map[string]string) { m["CORS_ALLOWED_ORIGINS"] = "http://app.example.edu" },
+	}
+	for name, mutate := range cases {
+		m := prod()
+		mutate(m)
+		if _, err := Load(env(m)); err == nil {
+			t.Errorf("%s: production must refuse it", name)
+		}
+	}
+	// The same values stay acceptable in development.
+	dev := validEnv()
+	dev["JWT_SECRET"] = "change-me-change-me-change-me-change-me"
+	dev["CORS_ALLOWED_ORIGINS"] = "http://localhost:5173"
+	if _, err := Load(env(dev)); err != nil {
+		t.Fatalf("development must accept them: %v", err)
 	}
 }

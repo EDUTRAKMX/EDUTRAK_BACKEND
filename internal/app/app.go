@@ -208,5 +208,6 @@ func NewHTTPHandler(db *database.DB, cfg config.Config, log *slog.Logger) (http.
 	attendancehttp.NewHandler(NewAttendanceService(db, cfg), identity, cfg.TrustedProxies).Register(mux)
 	tutoringhttp.NewHandler(NewTutoringService(db, cfg), identity).Register(mux)
 	analyticshttp.NewHandler(NewAnalyticsService(db, cfg), identity).Register(mux)
-	return httpx.Base(log, mux), nil
+	// Outermost first: request id/recover/log, security headers, CORS, then routes (JSON 404/405).
+	return httpx.Base(log, httpx.SecurityHeaders(httpx.CORS(cfg.CORSAllowedOrigins, httpx.JSONFallback(mux)))), nil
 }

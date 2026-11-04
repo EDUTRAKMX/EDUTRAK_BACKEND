@@ -1,5 +1,9 @@
 // Command seed creates the first ADMIN account from SEED_ADMIN_NUMBER and
 // SEED_ADMIN_PASSWORD. It is idempotent: an existing account is left untouched.
+//
+//	go run ./cmd/seed        first ADMIN (any environment)
+//	go run ./cmd/seed demo   fictitious demonstration data (never when APP_ENV=production)
+//
 // Use only fictitious data in development.
 package main
 
@@ -32,6 +36,22 @@ func run() error {
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		return err
+	}
+	if len(os.Args) > 1 && os.Args[1] == "demo" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		if cfg.Env == "production" {
+			return errors.New("refusing to create demo data when APP_ENV=production")
+		}
+		db, err := database.Connect(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		return runDemo(ctx, cfg, db)
+	}
+	if len(os.Args) > 1 {
+		return fmt.Errorf("unknown argument %q (only \"demo\" is supported)", os.Args[1])
 	}
 	number := strings.TrimSpace(os.Getenv("SEED_ADMIN_NUMBER"))
 	password := os.Getenv("SEED_ADMIN_PASSWORD")

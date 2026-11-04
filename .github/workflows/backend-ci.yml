@@ -6,9 +6,14 @@ on:
   push:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The whole job normally takes under 15 minutes; the bound exists so a hang is reported, not hidden.
+    timeout-minutes: 35
     services:
       postgres:
         image: postgres:16-alpine
@@ -29,11 +34,33 @@ jobs:
           go-version-file: go.mod
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go.mod is tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
       - name: vet
         run: go vet ./...
-      - name: test (race)
-        run: go test ./... -race -count=1
-      - name: coverage
-        run: go test ./... -coverprofile=coverage.out
       - name: build
         run: go build ./...
+      # One run does the race detector AND the coverage profile, against the real PostgreSQL service
+      # (integration, migration and OpenAPI contract tests included). The measured duration is
+      # about 6 minutes locally, so 25m leaves room for a slower runner without hiding a real hang.
+      - name: test (race, integration, coverage)
+        run: go test ./... -race -count=1 -timeout 25m -coverprofile=coverage.out
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+      # Migrations on a database that is not the per-test schema: apply twice (must be a no-op the
+      # second time), then load the fictitious demo data through the real API.
+      - name: migrate (twice) and demo seed
+        env:
+          DATABASE_URL: postgres://edutrak:edutrak_ci_password@localhost:5432/edutrak_test?sslmode=disable
+          JWT_SECRET: ci-only-secret-ci-only-secret-0123456789ab
+          STORAGE_DIR: ${{ runner.temp }}/evidence
+        run: |
+          createdb_url="postgres://edutrak:edutrak_ci_password@localhost:5432/postgres?sslmode=disable"
+          psql "$createdb_url" -c "CREATE DATABASE edutrak_migrate_check"
+          export DATABASE_URL="postgres://edutrak:edutrak_ci_password@localhost:5432/edutrak_migrate_check?sslmode=disable"
+          go run ./cmd/migrate
+          go run ./cmd/migrate
+          go run ./cmd/seed demo
+          go run ./cmd/seed demo
+      - name: docker image builds
+        run: docker build -t edutrak-backend:ci .
