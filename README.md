@@ -62,7 +62,7 @@ La rama principal del backend es `master`. Las modificaciones se gestionan media
 | Attendance (sesiones, QR dinámico con red institucional, captura manual, retardos, cierre, consultas) | Implementado (`/api/attendance/*`); NFC solo previsto como método |
 | Justifications (solicitud con evidencias privadas, revisión Tutor → Profesor, JUSTIFIED atómico en Attendance, consultas) | Implementado (`/api/justifications/*`) |
 | Tutoring (alumnos del tutor, resumen académico, seguimientos append-only, historial) | Implementado (`/api/tutoring/*`); sin pendientes/estados (el esquema no los tiene) |
-| Plataforma (CORS por orígenes, cabeceras de seguridad, 404/405 en JSON, health/ready, Dockerfile, compose, CI) | Implementado; el CI **no** se ha ejecutado en GitHub |
+| Plataforma (CORS por orígenes, cabeceras de seguridad, 404/405 en JSON, health/ready, Dockerfile, compose, CI) | Implementado; CI ejecutado correctamente en GitHub Actions (`backend-ci` #16). |
 | OpenAPI (`api/openapi.yaml`, 74 operaciones) y guía de integración con el frontend | Implementado y validado por pruebas de contrato |
 | Datos de demostración (`go run ./cmd/seed demo`) | Implementado (solo ficticios; se niega en producción) |
 | Analytics (indicadores por alumno/grupo, resumen del director, alertas explicables con recálculo idempotente) | Implementado (`/api/analytics/*`); sin predicción ni puntaje de riesgo |
@@ -378,8 +378,8 @@ Todas las rutas exigen `Authorization: Bearer <access_token>`. La autorización 
 
 | Método | Ruta | Acceso |
 |---|---|---|
-| POST | `` (JSON o `multipart/form-data`) | STUDENT, solo para una ausencia propia |
-| GET | `?status=` | lista filtrada en el backend: STUDENT las suyas · TUTOR las de alumnos de sus grupos · TEACHER las de sus asignaciones · DIRECTOR todas |
+| POST | `/api/justifications` (JSON o `multipart/form-data`) | STUDENT, solo para una ausencia propia |
+| GET | `/api/justifications?status=` | lista filtrada en el backend: STUDENT las suyas · TUTOR las de alumnos de sus grupos · TEACHER las de sus asignaciones · DIRECTOR todas |
 | GET | `/{id}` | el alumno dueño, el tutor del grupo, el profesor de la asignación, DIRECTOR |
 | POST | `/{id}/tutor-decision` `{"decision":"APPROVED\|REJECTED","comment"}` | TUTOR **actual** del grupo del alumno |
 | POST | `/{id}/teacher-decision` `{"decision","comment"}` | TEACHER de la asignación de la ausencia |
@@ -592,7 +592,7 @@ Cada módulo: `domain / application / ports / adapters`.
 ## Limitaciones conocidas
 - El rate limiting es por proceso; no protege contra un ataque distribuido sobre una cuenta desde muchas IPs.
 - Migraciones solo hacia adelante.
-- El workflow de CI está escrito pero **no se ha ejecutado en GitHub**.
+- El workflow `backend-ci` está configurado y se ha ejecutado correctamente en GitHub Actions, incluyendo pruebas de integración, cobertura, migraciones y compilación Docker.
 - No hay endpoint de consulta de auditoría.
 - Datos de prueba: solo ficticios (matrículas tipo `10000001`).
 - No se ha validado un despliegue real: TLS, proxy, rangos de red, respaldos y monitoreo dependen de la infraestructura de la institución. Este repositorio **no** afirma estar "listo para producción".
