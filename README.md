@@ -2,6 +2,53 @@
 
 API REST en Go (monolito modular, arquitectura hexagonal) para seguimiento académico y tutorial.
 
+## Documentación académica — Unidades 1 y 2
+
+EDUTRAK es una plataforma web de seguimiento académico y acompañamiento tutorial, desarrollada como proyecto de Ingeniería en Desarrollo y Gestión de Software de la Universidad Tecnológica de Torreón.
+
+La documentación del proyecto está organizada en dos unidades académicas e incluye análisis, planificación, arquitectura, diseño, control de versiones y modelo de datos.
+
+### Unidad 1 — Planeación, análisis y diseño
+
+La primera unidad establece los fundamentos del sistema:
+
+- Problemática, justificación y objetivos.
+- Alcance, roles y funcionalidades del MVP.
+- 25 requisitos funcionales y 12 no funcionales.
+- Análisis de 15 riesgos y sus contingencias.
+- Metodología, responsables y planificación de 26 tareas.
+- Selección del stack tecnológico.
+- Monolito modular con Arquitectura Hexagonal.
+- Patrones de diseño y modelo relacional.
+- Wireframes, validaciones y sistema visual.
+
+**[Consultar documentación completa de la Unidad 1](docs/UNIDAD_1.md)**
+
+### Unidad 2 — Versionamiento, prototipado, diagramas y datos
+
+La segunda unidad desarrolla la documentación relacionada con:
+
+- Organización del trabajo mediante Git y GitHub.
+- Estrategias de ramas, commits y Pull Requests.
+- Diseño y prototipado de interfaces.
+- Diagramas de arquitectura y estructura del sistema.
+- Modelo entidad-relación.
+- Diccionario de datos de 23 tablas.
+- Restricciones, relaciones y tipos de datos.
+- Integración documental del proyecto.
+
+**[Consultar documentación completa de la Unidad 2](docs/UNIDAD_2.md)**
+
+### Repositorios del proyecto
+
+El sistema utiliza dos repositorios independientes:
+
+- [EDUTRAK_BACKEND](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND): API REST en Go, arquitectura hexagonal y PostgreSQL.
+- [EDUTRAK_FRONTEND](https://github.com/EDUTRAKMX/EDUTRAK_FRONTEND): aplicación web en Angular.
+
+La rama principal del backend es `master`. Las modificaciones se gestionan mediante ramas de trabajo y Pull Requests con revisión del equipo.
+
+
 ## Estado real
 
 | Área | Estado |
