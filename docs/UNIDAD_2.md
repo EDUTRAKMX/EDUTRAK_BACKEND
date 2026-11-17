@@ -775,3 +775,58 @@ El diccionario formaliza **23 tablas** del diseño; las ilustraciones documentan
 
 La documentación establece la estructura técnica del proyecto y sus criterios de calidad. La trazabilidad de las funciones y verificaciones se apoya en el código, los commits, las revisiones, las ejecuciones de pruebas y los recursos de diseño asociados.
 
+
+
+## Evidencias de GitHub — Integración continua
+
+### Ejecución de GitHub Actions
+
+Se verificó la ejecución del flujo de integración continua `backend-ci` del repositorio EDUTRAK_BACKEND.
+
+**Resultados:**
+- Estado: exitoso.
+- Ejecución: #17.
+- Fecha: 17 de noviembre de 2026.
+- Duración: 9 minutos y 35 segundos.
+
+**Comprobaciones realizadas:**
+- Formato del código Go (`gofmt`).
+- Verificación de dependencias.
+- Análisis estático (`go vet`).
+- Compilación del backend.
+- Pruebas automatizadas, integración y cobertura.
+- Migraciones y datos de demostración.
+- Construcción de imagen Docker.
+
+**[Consultar evidencia de GitHub Actions](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/actions/runs/4415931510/job/134309279352)**
+
+### Pull Request de documentación
+
+La documentación de las Unidades 1 y 2 se incorporó mediante la rama `docs/backend`, utilizando un Pull Request dirigido a `master`.
+
+**[Consultar Pull Request #8](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/8)**
+
+El Pull Request cuenta con comprobaciones automatizadas exitosas y está sujeto a revisión y aprobación antes de su integración.
+
+
+
+
+### Evidencias de colaboración y control de versiones
+
+El desarrollo del backend EDUTRAK se organiza mediante ramas de trabajo y Pull Requests, utilizando revisiones de código y comprobaciones automatizadas antes de integrar cambios a la rama principal `master`.
+
+Los siguientes Pull Requests cuentan con aprobación y fueron integrados correctamente:
+
+| PR | Módulo o actividad | Estado |
+|---|---|---|
+| [#1](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/1) | Gestión académica | Fusionado y aprobado |
+| [#2](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/2) | Calificaciones | Fusionado y aprobado |
+| [#3](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/3) | Control de asistencia | Fusionado y aprobado |
+| [#4](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/4) | Gestión de justificaciones | Fusionado y aprobado |
+| [#5](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/5) | Seguimiento tutorial | Fusionado y aprobado |
+| [#6](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/6) | Indicadores y alertas académicas | Fusionado y aprobado |
+| [#7](https://github.com/EDUTRAKMX/EDUTRAK_BACKEND/pull/7) | Seguridad e integración del backend | Fusionado y aprobado |
+
+Estas evidencias demuestran el uso de GitHub para gestionar cambios, revisar contribuciones e integrar funcionalidades mediante un flujo de trabajo colaborativo.
+
+
