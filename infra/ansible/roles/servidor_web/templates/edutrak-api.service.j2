@@ -1,0 +1,49 @@
+# {{ ansible_managed }}
+[Unit]
+Description=API EDUTRAK ({{ p3_nombre }}, versión {{ p3_app_version }})
+After=network-online.target remote-fs.target
+Wants=network-online.target
+RequiresMountsFor={{ p3_app_evidencias }}
+
+[Service]
+Type=simple
+User={{ p3_usuario_servicio }}
+Group={{ p3_usuario_servicio }}
+EnvironmentFile={{ p3_app_config }}/edutrak.env
+WorkingDirectory={{ p3_app_estado }}
+ExecStart={{ p3_app_raiz }}/actual/api
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+# Sandbox: el proceso solo puede escribir en las evidencias.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths={{ p3_app_evidencias }}
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+# Una llamada bloqueada devuelve EPERM en lugar de matar el proceso (Go ajusta
+# RLIMIT_NOFILE al arrancar y debe poder continuar si no se le permite).
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

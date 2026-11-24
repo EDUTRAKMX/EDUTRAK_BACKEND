@@ -1,0 +1,15 @@
+# Copia a terraform.tfvars SOLO para pruebas desde tu PC (está en .gitignore).
+# En el pipeline todos estos valores llegan como TF_VAR_* desde secretos y entradas.
+
+region         = "us-east-1"
+proyecto       = "edutrak-p3"
+nombre_bastion = "SSHD_Conexion"
+
+# Salida de: puttygen mi_llave.ppk -O public-openssh
+llave_publica_ssh = "ssh-rsa AAAA... rsa-key-20261124"
+
+# Tu IP pública (https://checkip.amazonaws.com) con /32
+cidrs_administracion = ["203.0.113.10/32"]
+
+tipo_instancia = "t3.micro"
+# tipos_por_rol = { bd = "t3.small" }

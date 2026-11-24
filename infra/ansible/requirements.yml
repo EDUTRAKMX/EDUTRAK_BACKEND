@@ -1,0 +1,11 @@
+---
+# Colecciones usadas por los roles (versiones probadas con ansible-core 2.22).
+collections:
+  - name: ansible.posix
+    version: ">=2.0.0,<3.0.0"
+  - name: community.general
+    version: ">=11.0.0,<15.0.0"
+  - name: community.crypto
+    version: ">=3.0.0,<4.0.0"
+  - name: community.postgresql
+    version: ">=4.0.0,<6.0.0"

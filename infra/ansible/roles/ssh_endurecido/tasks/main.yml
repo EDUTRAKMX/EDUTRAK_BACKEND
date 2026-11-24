@@ -1,0 +1,109 @@
+---
+# Hardening de OpenSSH (cap. 03 y 15): puerto propio, solo IP privada, RSA 4096,
+# llave + contraseña + TOTP, sin root, sin contraseñas solas y sin funciones que no
+# se usan (reenvíos, X11, túneles, sftp, GSSAPI, ECDSA, algoritmos débiles).
+
+- name: Respaldo de la configuración original de SSH (una sola vez)
+  ansible.builtin.command: cp -a /etc/ssh {{ p3_respaldos }}/ssh
+  args:
+    creates: "{{ p3_respaldos }}/ssh"
+
+- name: ¿Esta versión de sshd admite RequiredRSASize?
+  ansible.builtin.command: /usr/sbin/sshd -t -f /dev/null -o RequiredRSASize={{ p3_ssh_longitud_rsa }}
+  register: p3_sshd_rsa
+  changed_when: false
+  failed_when: false
+
+- name: Recordar si se puede exigir el tamaño de RSA en sshd
+  ansible.builtin.set_fact:
+    p3_ssh_required_rsa_size: "{{ p3_sshd_rsa.rc == 0 }}"
+
+- name: Retirar la llave de host ECDSA (no se usa)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/ssh/ssh_host_ecdsa_key
+    - /etc/ssh/ssh_host_ecdsa_key.pub
+
+- name: Impedir que se regenere ECDSA al arrancar
+  ansible.builtin.systemd_service:
+    name: sshd-keygen@ecdsa.service
+    masked: true
+
+- name: Tamaño de la llave de host RSA
+  ansible.builtin.command: ssh-keygen -l -f /etc/ssh/ssh_host_rsa_key.pub
+  register: p3_rsa_host
+  changed_when: false
+
+- name: Regenerar la llave de host RSA con la longitud exigida
+  ansible.builtin.shell: |
+    set -euo pipefail
+    rm -f /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub
+    ssh-keygen -q -t rsa -b {{ p3_ssh_longitud_rsa }} -N '' -f /etc/ssh/ssh_host_rsa_key
+    chown root:ssh_keys /etc/ssh/ssh_host_rsa_key
+    chmod 0640 /etc/ssh/ssh_host_rsa_key
+    chmod 0644 /etc/ssh/ssh_host_rsa_key.pub
+    restorecon -F /etc/ssh/ssh_host_rsa_key /etc/ssh/ssh_host_rsa_key.pub
+  args:
+    executable: /bin/bash
+  when: (p3_rsa_host.stdout.split()[0] | int) < p3_ssh_longitud_rsa
+  changed_when: true
+  notify: Recargar sshd
+
+- name: Contar grupos Diffie-Hellman menores a 3072 bits en /etc/ssh/moduli
+  ansible.builtin.command: awk '$5 < 3071 && $1 !~ /^#/' /etc/ssh/moduli
+  register: p3_moduli_debiles
+  changed_when: false
+
+- name: Quitar grupos Diffie-Hellman débiles
+  ansible.builtin.shell: |
+    set -euo pipefail
+    awk '$1 ~ /^#/ || $5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.p3
+    chmod 0644 /etc/ssh/moduli.p3
+    mv -f /etc/ssh/moduli.p3 /etc/ssh/moduli
+    restorecon -F /etc/ssh/moduli
+  args:
+    executable: /bin/bash
+  when: p3_moduli_debiles.stdout | length > 0
+  changed_when: true
+  notify: Recargar sshd
+
+- name: sshd_config completo y validado (sshd -t)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/plantillas/sshd_config.j2"
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s
+  vars:
+    p3_ssh_aprovisionamiento: true
+  notify: Recargar sshd
+
+# Después de escribir el archivo principal (que ya no los incluye): así nunca queda
+# un sshd sin "Port" si algo falla a la mitad.
+- name: Fragmentos de sshd_config.d de Rocky/cloud-init
+  ansible.builtin.find:
+    paths: /etc/ssh/sshd_config.d
+    patterns: "*.conf"
+  register: p3_fragmentos_sshd
+
+- name: Retirar los fragmentos (quedan en el respaldo)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ p3_fragmentos_sshd.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Aplicar la configuración de sshd
+  ansible.builtin.meta: flush_handlers
+
+# Cerrar la conexión multiplexada para que la prueba use una conexión nueva.
+- name: Cerrar la conexión SSH reutilizada
+  ansible.builtin.meta: reset_connection
+
+- name: Comprobar que se puede seguir entrando (cuenta temporal, solo llave)
+  ansible.builtin.wait_for_connection:
+    timeout: 120

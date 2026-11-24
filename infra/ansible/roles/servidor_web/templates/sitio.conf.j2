@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# Guía, cap. 11 adaptado: NGINX escucha solo en la IP privada, solo acepta al
+# balanceador y reenvía a la API local (en lugar de PHP-FPM por socket).
+server {
+    listen {{ p3_ip }}:80 default_server;
+    server_name _;
+    server_tokens off;
+    charset utf-8;
+
+    access_log /var/log/nginx/sitio_access.log principal;
+    error_log  /var/log/nginx/sitio_error.log;
+
+    allow {{ p3_ip_balanceador }};
+    deny all;
+
+    # Identidad visible del nodo (cap. 17) sin tocar la configuración de la API.
+    add_header X-Nodo "{{ p3_nombre }}" always;
+
+    # Archivo estático (no "return"): así también pasa por allow/deny.
+    location = /nodo {
+        default_type text/plain;
+        alias /usr/share/nginx/p3/nodo;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:{{ p3_app_puerto }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Queda "cliente, balanceador"; la API solo confía en 127.0.0.1 y el balanceador.
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+
+    location ~ /\. { deny all; }
+}

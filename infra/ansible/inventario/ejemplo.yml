@@ -1,0 +1,80 @@
+# Ejemplo de inventario (el real lo genera infra/scripts/generar_inventario.py en
+# inventario/hosts.yml, que no se sube al repositorio). Sirve para --syntax-check
+# y para ver qué variables recibe cada máquina.
+all:
+  vars:
+    ansible_user: ansible
+    ansible_ssh_private_key_file: /ruta/a/id_rsa
+    ansible_ssh_common_args: "-F /ruta/a/inventario/ssh_config"
+    p3_ssh_config: /ruta/a/inventario/ssh_config
+    p3_efs_ip: 10.106.1.20
+    p3_puerto_bd: 33609
+  children:
+    bastion:
+      hosts:
+        sshd-conexion:
+          ansible_host: p3-bastion
+          ansible_port: 24783
+          p3_clave: bastion
+          p3_nombre: SSHD_Conexion
+          p3_rol: bastion
+          p3_ip: 10.106.0.13
+          p3_ip_publica: 203.0.113.10
+          p3_puerto_ssh: 24783
+          p3_usuario_admin: coriander
+          p3_instancia: i-0123456789abcdef0
+    balanceadores:
+      hosts:
+        balanceador:
+          ansible_host: 10.106.0.14
+          ansible_port: 22170
+          p3_clave: balanceador
+          p3_nombre: Balanceador
+          p3_rol: balanceador
+          p3_ip: 10.106.0.14
+          p3_ip_publica: 203.0.113.11
+          p3_puerto_ssh: 22170
+          p3_usuario_admin: asparagus
+          p3_instancia: i-0123456789abcdef1
+    web:
+      hosts:
+        page-1:
+          ansible_host: 10.106.1.12
+          ansible_port: 38236
+          p3_clave: page1
+          p3_nombre: Page-1
+          p3_rol: web
+          p3_ip: 10.106.1.12
+          p3_ip_publica: ""
+          p3_puerto_ssh: 38236
+          p3_usuario_admin: pumpkin
+          p3_instancia: i-0123456789abcdef2
+        page-2:
+          ansible_host: 10.106.1.15
+          ansible_port: 42157
+          p3_clave: page2
+          p3_nombre: Page-2
+          p3_rol: web
+          p3_ip: 10.106.1.15
+          p3_ip_publica: ""
+          p3_puerto_ssh: 42157
+          p3_usuario_admin: lettuce
+          p3_instancia: i-0123456789abcdef3
+    bd:
+      hosts:
+        bd-postgresql:
+          ansible_host: 10.106.1.16
+          ansible_port: 24170
+          p3_clave: bd
+          p3_nombre: BD-PostgreSQL
+          p3_rol: bd
+          p3_ip: 10.106.1.16
+          p3_ip_publica: ""
+          p3_puerto_ssh: 24170
+          p3_usuario_admin: guava
+          p3_instancia: i-0123456789abcdef4
+    internos:
+      children:
+        balanceadores: {}
+        web: {}
+        bd: {}

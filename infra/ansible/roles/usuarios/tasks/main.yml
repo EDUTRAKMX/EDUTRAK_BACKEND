@@ -1,0 +1,144 @@
+---
+# Cuentas humanas de la guía (cap. 02): contraseña, TOTP propio en ~/.otp (cap. 14),
+# sudo solo para quien la guía lo indica y llave de PuTTYgen solo para coriander.
+
+- name: Comprobar que existen secretos para cada cuenta
+  ansible.builtin.assert:
+    that:
+      - p3_secretos.usuarios[item.nombre] is defined
+      - p3_secretos.usuarios[item.nombre].password | length >= 14
+      - p3_secretos.usuarios[item.nombre].totp | length >= 16
+    fail_msg: "No hay secretos para {{ item.nombre }}; vuelve a ejecutar secretos_lab.py asegurar con esa cuenta."
+    quiet: true
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Crear cuentas administrativas
+  ansible.builtin.user:
+    name: "{{ item.nombre }}"
+    comment: "Practica 3 - {{ 'acceso SSH' if item.ssh else 'solo local' }}"
+    shell: /bin/bash
+    create_home: true
+    password: "{{ p3_secretos.usuarios[item.nombre].password | password_hash('sha512', p3_sal) }}"
+    update_password: on_create
+  vars:
+    # Sal estable por usuario y equipo: Ansible no ve cambios en cada ejecución.
+    p3_sal: "{{ (item.nombre ~ inventory_hostname) | hash('sha256') | truncate(16, true, '') }}"
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+  no_log: true
+
+- name: Home privado (700)
+  ansible.builtin.file:
+    path: "/home/{{ item.nombre }}"
+    state: directory
+    owner: "{{ item.nombre }}"
+    group: "{{ item.nombre }}"
+    mode: "0700"
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Directorio ~/.otp (700)
+  ansible.builtin.file:
+    path: "/home/{{ item.nombre }}/.otp"
+    state: directory
+    owner: "{{ item.nombre }}"
+    group: "{{ item.nombre }}"
+    mode: "0700"
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Etiqueta SELinux auth_home_t para ~/.otp (cap. 14)
+  community.general.sefcontext:
+    target: '/home/{{ item.nombre }}/\.otp(/.*)?'
+    setype: auth_home_t
+    state: present
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Leer el secreto TOTP instalado
+  ansible.builtin.command: head -n 1 /home/{{ item.nombre }}/.otp/.google_authenticator
+  register: p3_totp_actual
+  changed_when: false
+  failed_when: false
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+  no_log: true
+
+# Solo se reescribe si el secreto cambió: el archivo guarda el estado de
+# DISALLOW_REUSE y RATE_LIMIT y no debe reiniciarse en cada ejecución.
+- name: Secreto TOTP (TOTP, sin reutilización, ventana estándar, 3 intentos/30 s)
+  ansible.builtin.template:
+    src: google_authenticator.j2
+    dest: "/home/{{ item.nombre }}/.otp/.google_authenticator"
+    owner: "{{ item.nombre }}"
+    group: "{{ item.nombre }}"
+    mode: "0600"
+  vars:
+    p3_secreto_usuario: "{{ p3_secretos.usuarios[item.nombre] }}"
+  when: p3_totp_actual.results[indice].stdout | default('') != p3_secretos.usuarios[item.nombre].totp
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    index_var: indice
+    label: "{{ item.nombre }}"
+  no_log: true
+
+- name: Aplicar etiquetas SELinux en ~/.otp
+  ansible.builtin.command: restorecon -RvF /home/{{ item.nombre }}/.otp
+  register: p3_restorecon_otp
+  changed_when: p3_restorecon_otp.stdout | length > 0
+  loop: "{{ p3_usuarios_humanos }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Política común de sudo
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/00-p3-politica
+    content: |
+      # {{ ansible_managed }}
+      Defaults    use_pty
+      Defaults    logfile="/var/log/sudo.log"
+      Defaults    timestamp_timeout=5
+      Defaults    passwd_tries=3
+      Defaults    !visiblepw
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Sudo con contraseña para las cuentas que la guía indica (cap. 14)
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ item.nombre }}"
+    content: |
+      # {{ ansible_managed }}
+      {{ item.nombre }} ALL=(ALL:ALL) PASSWD: ALL
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  loop: "{{ p3_usuarios_humanos | selectattr('sudo') | list }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Sin sudo para las demás cuentas humanas
+  ansible.builtin.file:
+    path: "/etc/sudoers.d/{{ item.nombre }}"
+    state: absent
+  loop: "{{ p3_usuarios_humanos | rejectattr('sudo') | list }}"
+  loop_control:
+    label: "{{ item.nombre }}"
+
+- name: Llave de PuTTYgen para el acceso SSH al bastión (RSA 4096)
+  ansible.posix.authorized_key:
+    user: "{{ p3_usuario_admin }}"
+    key: "{{ p3_llave_publica_admin }}"
+    key_options: restrict,pty
+    exclusive: true
+    state: present
+  when: inventory_hostname in groups['bastion']

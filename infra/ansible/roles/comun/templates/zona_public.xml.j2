@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- {{ ansible_managed }} -->
+<!-- {{ p3_nombre }}: solo los puertos de la política de acceso (guía, cap. 03). -->
+<zone>
+  <short>Public</short>
+  <description>Práctica 3: sin servicios por defecto (ssh 22, cockpit, dhcpv6-client); solo las reglas listadas.</description>
+{% for regla in p3_firewall_reglas if (regla.origenes | default([]) | length) == 0 %}
+  <port protocol="tcp" port="{{ regla.puerto }}"/>
+{% endfor %}
+{% for regla in p3_firewall_reglas if (regla.origenes | default([]) | length) > 0 %}
+{% for origen in regla.origenes %}
+  <rule family="ipv4">
+    <source address="{{ origen }}/32"/>
+    <destination address="{{ p3_ip }}/32"/>
+    <port protocol="tcp" port="{{ regla.puerto }}"/>
+    <accept/>
+  </rule>
+{% endfor %}
+{% endfor %}
+</zone>
