@@ -1,0 +1,8 @@
+---
+profile: production
+offline: true
+exclude_paths:
+  - inventario/
+skip_list:
+  - name[casing]
+  - var-naming[no-role-prefix]
