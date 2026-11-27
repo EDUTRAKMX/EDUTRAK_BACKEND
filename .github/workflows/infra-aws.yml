@@ -1,0 +1,424 @@
+name: infra-aws-practica3
+
+# Práctica 3 - Infraestructura web segura en AWS (Terraform + Ansible).
+# 5 máquinas: SSHD_Conexion (cliente SSH / bastión), Balanceador, Page-1, Page-2 y BD.
+#
+# Secretos del repositorio (Settings > Secrets and variables > Actions):
+#   SSH_PRIVATE_KEY      contenido completo de tu llave privada .ppk de PuTTYgen (RSA 4096)
+#   SSH_KEY_PASSPHRASE   frase de paso de la .ppk (opcional si no tiene)
+#   ADMIN_CIDRS          tu IP pública con /32 (varias separadas por coma)
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   (o la variable AWS_ROLE_ARN para OIDC)
+# La llave privada va como SECRETO y no como entrada: las entradas de un workflow
+# quedan visibles en texto plano para cualquiera que vea la ejecución.
+
+on:
+  workflow_dispatch:
+    inputs:
+      accion:
+        description: "Qué hacer"
+        type: choice
+        options: [plan, aplicar, recrear, destruir]
+        default: plan
+      nombre_bastion:
+        description: "Nombre de la máquina cliente SSH (bastión)"
+        type: string
+        default: SSHD_Conexion
+      region:
+        description: "Región de AWS"
+        type: string
+        default: us-east-1
+      tipo_instancia:
+        description: "Tipo de instancia de las 5 máquinas"
+        type: string
+        default: t3.micro
+      bloquear_aprovisionamiento:
+        description: "Al terminar, bloquear la cuenta temporal de Ansible (solo quedan llave + contraseña + TOTP)"
+        type: boolean
+        default: true
+      redes_asistencia:
+        description: "ALLOWED_NETWORKS de la API (CIDR de la red institucional). Vacío = ADMIN_CIDRS"
+        type: string
+        default: ""
+      crear_admin_app:
+        description: "Crear el primer ADMIN de la API (contraseña en SSM)"
+        type: boolean
+        default: true
+      borrar_secretos:
+        description: "Con destruir: borrar también los secretos de SSM (tendrás que registrar de nuevo los TOTP)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/infra-aws.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-aws-${{ vars.PROYECTO || 'edutrak-p3' }}
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.17.2"
+  ANSIBLE_VERSION: "15.0.0"
+  ANSIBLE_LINT_VERSION: "26.11.0"
+
+jobs:
+  validar:
+    name: Validar Terraform, Ansible y scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt / validate
+        run: |
+          terraform fmt -check -recursive infra/terraform
+          terraform -chdir=infra/terraform init -backend=false -input=false
+          terraform -chdir=infra/terraform validate
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Herramientas
+        run: pip install "ansible==${ANSIBLE_VERSION}" "ansible-lint==${ANSIBLE_LINT_VERSION}" passlib boto3 shellcheck-py
+
+      - name: Scripts
+        run: |
+          shellcheck infra/scripts/*.sh
+          python -m py_compile infra/scripts/*.py
+
+      - name: Ansible (sintaxis y lint)
+        working-directory: infra/ansible
+        run: |
+          ansible-playbook -i inventario/ejemplo.yml --syntax-check site.yml
+          ansible-lint
+
+  desplegar:
+    name: ${{ inputs.accion }} en ${{ inputs.region }}
+    if: github.event_name == 'workflow_dispatch'
+    needs: validar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Un "environment" permite exigir aprobación manual antes de tocar AWS.
+    environment: aws-practica3
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROYECTO: ${{ vars.PROYECTO || 'edutrak-p3' }}
+      AWS_REGION: ${{ inputs.region }}
+      ACCION: ${{ inputs.accion }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      TF_DIR: infra/terraform
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validar entradas
+        env:
+          NOMBRE: ${{ inputs.nombre_bastion }}
+          REGION: ${{ inputs.region }}
+          TIPO: ${{ inputs.tipo_instancia }}
+          REDES: ${{ inputs.redes_asistencia }}
+        run: |
+          set -euo pipefail
+          [[ $NOMBRE =~ ^[A-Za-z][A-Za-z0-9_.-]{0,62}$ ]] || { echo "::error::nombre_bastion inválido"; exit 1; }
+          [[ $REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || { echo "::error::región inválida"; exit 1; }
+          [[ $TIPO =~ ^[a-z][a-z0-9]*\.[a-z0-9]+$ ]] || { echo "::error::tipo de instancia inválido"; exit 1; }
+          [[ -z $REDES || $REDES =~ ^[0-9./,\ ]+$ ]] || { echo "::error::redes_asistencia debe ser CIDR separados por coma"; exit 1; }
+
+      - name: Comprobar secretos requeridos
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ADMIN_CIDRS: ${{ secrets.ADMIN_CIDRS }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          faltan=0
+          [ -n "$SSH_PRIVATE_KEY" ] || { echo "::error::Falta el secreto SSH_PRIVATE_KEY (tu llave .ppk)"; faltan=1; }
+          [ -n "$ADMIN_CIDRS" ] || { echo "::error::Falta el secreto ADMIN_CIDRS (tu IP/32)"; faltan=1; }
+          [ -n "$AWS_ROLE_ARN" ] || [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "::error::Faltan credenciales de AWS"; faltan=1; }
+          exit $faltan
+
+      - name: Credenciales de AWS (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-practica3-${{ github.run_id }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Credenciales de AWS (llaves de acceso)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Herramientas (Ansible, boto3, puttygen)
+        run: |
+          pip install "ansible==${ANSIBLE_VERSION}" passlib boto3
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq putty-tools
+
+      - name: Llave de PuTTYgen -> OpenSSH (RSA 4096)
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/llave"
+          mkdir -p "$dir"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$dir/entrada"
+          frase=()
+          if [ -n "${SSH_KEY_PASSPHRASE:-}" ]; then
+            printf '%s' "$SSH_KEY_PASSPHRASE" > "$dir/frase"
+            frase=("$dir/frase")
+          fi
+          bash infra/scripts/preparar_llave.sh "$dir/entrada" "$dir" "${frase[@]}"
+          rm -f "$dir/entrada" "$dir/frase"
+          echo "TF_VAR_llave_publica_ssh=$(cat "$dir/id_rsa.pub")" >> "$GITHUB_ENV"
+
+      - name: Variables de Terraform
+        env:
+          ADMIN_CIDRS: ${{ secrets.ADMIN_CIDRS }}
+          NOMBRE: ${{ inputs.nombre_bastion }}
+          TIPO: ${{ inputs.tipo_instancia }}
+          AMI_ID: ${{ vars.AMI_ID }}
+        run: |
+          set -euo pipefail
+          cidrs=$(python3 -c 'import json,os; print(json.dumps([c.strip() for c in os.environ["ADMIN_CIDRS"].split(",") if c.strip()]))')
+          {
+            echo "TF_VAR_cidrs_administracion=$cidrs"
+            echo "TF_VAR_proyecto=$PROYECTO"
+            echo "TF_VAR_region=$AWS_REGION"
+            echo "TF_VAR_nombre_bastion=$NOMBRE"
+            echo "TF_VAR_tipo_instancia=$TIPO"
+            # Opcional: AMI fija si la búsqueda de la Rocky 9 oficial no encuentra imagen en la región.
+            if [ -n "${AMI_ID:-}" ]; then echo "TF_VAR_ami_id=$AMI_ID"; fi
+          } >> "$GITHUB_ENV"
+
+      - name: Bucket del estado de Terraform (privado, cifrado y versionado)
+        env:
+          BUCKET_FIJO: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          cuenta=$(aws sts get-caller-identity --query Account --output text)
+          bucket="${BUCKET_FIJO:-${PROYECTO}-tfstate-${cuenta}-${AWS_REGION}}"
+          if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+            echo "Creando s3://$bucket"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$bucket"
+            else
+              aws s3api create-bucket --bucket "$bucket" --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$bucket"
+            aws s3api put-public-access-block --bucket "$bucket" --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+            aws s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
+            aws s3api put-bucket-encryption --bucket "$bucket" --server-side-encryption-configuration \
+              '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+            aws s3api put-bucket-policy --bucket "$bucket" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"SoloTLS\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::$bucket\",\"arn:aws:s3:::$bucket/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
+          fi
+          echo "TF_STATE_BUCKET=$bucket" >> "$GITHUB_ENV"
+
+      - name: terraform init
+        run: |
+          terraform -chdir="$TF_DIR" init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$PROYECTO/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform plan
+        if: inputs.accion == 'plan'
+        run: terraform -chdir="$TF_DIR" plan -input=false
+
+      - name: terraform destroy
+        if: inputs.accion == 'destruir'
+        run: terraform -chdir="$TF_DIR" destroy -auto-approve -input=false
+
+      - name: Borrar secretos de SSM
+        if: inputs.accion == 'destruir' && inputs.borrar_secretos
+        run: python3 infra/scripts/secretos_lab.py borrar --proyecto "$PROYECTO" --region "$AWS_REGION"
+
+      - name: terraform apply
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        run: |
+          set -euo pipefail
+          reemplazos=()
+          if [ "$ACCION" = "recrear" ]; then
+            while read -r recurso; do
+              reemplazos+=("-replace=$recurso")
+            done < <(terraform -chdir="$TF_DIR" state list | grep '^aws_instance\.nodo\[' || true)
+            echo "Se recrearán ${#reemplazos[@]} máquinas"
+          fi
+          terraform -chdir="$TF_DIR" apply -auto-approve -input=false "${reemplazos[@]}"
+          terraform -chdir="$TF_DIR" output -json > "$RUNNER_TEMP/salidas.json"
+
+      - name: Secretos del laboratorio en SSM (contraseñas, TOTP, BD, JWT)
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        run: |
+          set -euo pipefail
+          usuarios=$(python3 -c 'import json,os; d=json.load(open(os.environ["RUNNER_TEMP"]+"/salidas.json"))["inventario"]["value"]; print(",".join(sorted({n["usuario_admin"] for n in d.values()} | {"celery"})))')
+          python3 infra/scripts/secretos_lab.py asegurar --proyecto "$PROYECTO" --region "$AWS_REGION" \
+            --usuarios "$usuarios" --salida "$RUNNER_TEMP/secretos.json" --mascara-gha
+
+      - uses: actions/setup-go@v7
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        with:
+          go-version-file: go.mod
+
+      - name: Compilar la API EDUTRAK (api, migrate, seed)
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/edutrak"
+          for cmd in api migrate seed; do
+            go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/edutrak/$cmd" "./cmd/$cmd"
+          done
+          ls -l "$RUNNER_TEMP/edutrak"
+
+      - name: Abrir el SSH del bastión SOLO para este runner
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        run: |
+          set -euo pipefail
+          ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')
+          [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "::error::No se pudo obtener la IP del runner"; exit 1; }
+          sg=$(jq -r '.sg_bastion_id.value' "$RUNNER_TEMP/salidas.json")
+          puerto=$(jq -r '.bastion_puerto_ssh.value' "$RUNNER_TEMP/salidas.json")
+          {
+            echo "SG_BASTION=$sg"
+            echo "PUERTO_BASTION=$puerto"
+          } >> "$GITHUB_ENV"
+          if aws ec2 authorize-security-group-ingress --group-id "$sg" \
+              --ip-permissions "IpProtocol=tcp,FromPort=$puerto,ToPort=$puerto,IpRanges=[{CidrIp=$ip/32,Description=runner-gha-$GITHUB_RUN_ID}]" \
+              >/dev/null 2>"$RUNNER_TEMP/sg.err"; then
+            # Solo se retira al final la regla que se agregó aquí.
+            echo "RUNNER_CIDR=$ip/32" >> "$GITHUB_ENV"
+          elif grep -q 'InvalidPermission.Duplicate' "$RUNNER_TEMP/sg.err"; then
+            echo "La IP del runner ya estaba autorizada (es una de ADMIN_CIDRS)."
+          else
+            cat "$RUNNER_TEMP/sg.err" >&2
+            exit 1
+          fi
+
+      - name: Inventario de Ansible
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        run: |
+          python3 infra/scripts/generar_inventario.py "$RUNNER_TEMP/salidas.json" \
+            --llave "$RUNNER_TEMP/llave/id_rsa" --destino infra/ansible/inventario
+
+      - name: Esperar el SSH del bastión
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        run: |
+          set -uo pipefail
+          for intento in $(seq 1 60); do
+            if salida=$(ssh -F infra/ansible/inventario/ssh_config -p "$PUERTO_BASTION" -o BatchMode=yes p3-bastion true 2>&1); then
+              echo "Bastión listo"; exit 0
+            fi
+            if grep -q 'Permission denied' <<<"$salida"; then
+              echo "::error::La cuenta temporal de aprovisionamiento ya fue bloqueada en una ejecución anterior. Ejecuta el workflow con accion=recrear."
+              exit 1
+            fi
+            echo "Intento $intento: aún no responde"; sleep 10
+          done
+          echo "::error::El bastión no respondió por SSH en 10 minutos (revisa la consola de EC2 / cloud-init)."
+          exit 1
+
+      - name: Ansible - hardening SSH/PAM y despliegue
+        if: inputs.accion == 'aplicar' || inputs.accion == 'recrear'
+        working-directory: infra/ansible
+        env:
+          ANSIBLE_FORCE_COLOR: "1"
+          BLOQUEAR: ${{ inputs.bloquear_aprovisionamiento }}
+          CREAR_ADMIN: ${{ inputs.crear_admin_app }}
+          REDES: ${{ inputs.redes_asistencia }}
+          ADMIN_CIDRS: ${{ secrets.ADMIN_CIDRS }}
+          ADMIN_NUMERO: ${{ vars.APP_ADMIN_NUMERO || '10000001' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          t = os.environ["RUNNER_TEMP"]
+          redes = os.environ.get("REDES") or os.environ["ADMIN_CIDRS"]
+          v = {
+              "p3_proyecto": os.environ["PROYECTO"],
+              "p3_llave_publica_admin": open(f"{t}/llave/id_rsa.pub").read().strip(),
+              "p3_bloquear_aprovisionamiento": os.environ["BLOQUEAR"] == "true",
+              "p3_app_binarios": f"{t}/edutrak",
+              "p3_app_version": os.environ["GITHUB_SHA"][:12],
+              "p3_app_redes_asistencia": ",".join(c.strip() for c in redes.split(",") if c.strip()),
+              "p3_app_crear_admin": os.environ["CREAR_ADMIN"] == "true",
+              "p3_app_admin_numero": os.environ["ADMIN_NUMERO"],
+          }
+          fd = os.open(f"{t}/despliegue.json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "w") as f:
+              json.dump(v, f)
+          PY
+          ansible-playbook site.yml \
+            -e "@$RUNNER_TEMP/secretos.json" \
+            -e "@$RUNNER_TEMP/despliegue.json"
+
+      - name: Cerrar el SSH del runner
+        if: always() && env.RUNNER_CIDR != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$SG_BASTION" \
+            --ip-permissions "IpProtocol=tcp,FromPort=$PUERTO_BASTION,ToPort=$PUERTO_BASTION,IpRanges=[{CidrIp=$RUNNER_CIDR}]" \
+            >/dev/null || echo "::warning::No se pudo retirar la regla temporal $RUNNER_CIDR del grupo $SG_BASTION; bórrala a mano."
+
+      - name: Resumen
+        if: success() && (inputs.accion == 'aplicar' || inputs.accion == 'recrear')
+        env:
+          BLOQUEAR: ${{ inputs.bloquear_aprovisionamiento }}
+        run: |
+          s="$RUNNER_TEMP/salidas.json"
+          {
+            echo "## Infraestructura lista"
+            echo ""
+            echo "| Máquina | IP privada | IP pública | Puerto SSH | Usuario |"
+            echo "|---|---|---|---|---|"
+            jq -r '.inventario.value[] | "| \(.nombre) | \(.ip_privada) | \(.ip_publica // "-") | \(.puerto_ssh) | \(.usuario_admin) |"' "$s"
+            echo ""
+            echo "**PuTTY:** Host \`$(jq -r .bastion_ip_publica.value "$s")\`, Port \`$(jq -r .bastion_puerto_ssh.value "$s")\`, usuario \`coriander\`, tu .ppk en *Connection > SSH > Auth > Credentials*."
+            echo "Te pedirá *Password* y *Verification code* (TOTP)."
+            echo ""
+            echo "**Aplicación:** $(jq -r .url_aplicacion.value "$s") (prueba \`/nodo\` y \`/healthz\`)"
+            echo ""
+            echo "**Contraseñas y TOTP:** \`python3 infra/scripts/secretos_lab.py mostrar --proyecto $PROYECTO --region $AWS_REGION --qr\`"
+            echo "o en la consola de AWS: Systems Manager > Parameter Store > \`/$PROYECTO/\`."
+            echo ""
+            echo "Cuenta temporal de aprovisionamiento bloqueada: **$BLOQUEAR**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Borrar llaves y secretos del runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/llave" "$RUNNER_TEMP/secretos.json" "$RUNNER_TEMP/despliegue.json" infra/ansible/inventario/hosts.yml infra/ansible/inventario/ssh_config infra/ansible/inventario/known_hosts
