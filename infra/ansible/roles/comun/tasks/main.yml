@@ -1,0 +1,203 @@
+---
+# Capítulo 03: partir de Rocky Linux 9 actualizado, SELinux activo, firewall con solo
+# los puertos de la política de acceso y nada abierto "por conveniencia".
+
+- name: SELinux en modo enforcing (la guía prohíbe desactivarlo)
+  ansible.posix.selinux:
+    policy: targeted
+    state: enforcing
+
+- name: Directorio de respaldos de la práctica
+  ansible.builtin.file:
+    path: "{{ p3_respaldos }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Repositorio EPEL (google-authenticator para PAM)
+  ansible.builtin.dnf:
+    name: "{{ p3_paquetes_base }}"
+    state: present
+
+- name: Paquetes comunes
+  ansible.builtin.dnf:
+    name: "{{ p3_paquetes_comunes }}"
+    state: present
+
+- name: Retirar paquetes de servicios que no se usan
+  ansible.builtin.dnf:
+    name: "{{ p3_paquetes_retirar }}"
+    state: absent
+
+- name: Actualizar el sistema
+  ansible.builtin.dnf:
+    name: "*"
+    state: latest # noqa: package-latest
+    update_only: true
+  when: p3_actualizar_paquetes | bool
+
+- name: Comprobar si hace falta reiniciar (kernel/glibc/systemd)
+  ansible.builtin.command: needs-restarting -r
+  register: p3_reinicio
+  changed_when: false
+  failed_when: p3_reinicio.rc not in [0, 1]
+
+# Primero los nodos internos y después el bastión: los internos se alcanzan a
+# través del bastión, así que no deben reiniciarse a la vez.
+- name: Reiniciar nodos internos que lo requieran
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+    msg: "Reinicio por actualizaciones (Ansible)"
+  when:
+    - p3_reinicio.rc == 1
+    - inventory_hostname not in groups['bastion']
+
+- name: Reiniciar el bastión si lo requiere
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+    msg: "Reinicio por actualizaciones (Ansible)"
+  when:
+    - p3_reinicio.rc == 1
+    - inventory_hostname in groups['bastion']
+
+- name: Zona horaria
+  community.general.timezone:
+    name: "{{ p3_zona_horaria }}"
+
+# El TOTP depende de la hora exacta. Amazon Time Sync es local (169.254.169.123),
+# no necesita abrir UDP 123 a Internet y no pasa por los grupos de seguridad.
+- name: chrony con Amazon Time Sync y sin puerto de comandos en red
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reiniciar chronyd
+
+- name: chronyd activo
+  ansible.builtin.systemd_service:
+    name: chronyd
+    enabled: true
+    state: started
+
+- name: Parámetros del kernel endurecidos
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/90-p3-endurecimiento.conf
+    reload: true
+    state: present
+  loop: "{{ p3_sysctl | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Sin volcados de memoria (pueden contener contraseñas o secretos TOTP)
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/50-p3-sin-core.conf
+    content: |
+      # Gestionado por Ansible
+      *    hard    core    0
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Directorio de configuración de systemd-coredump
+  ansible.builtin.file:
+    path: /etc/systemd/coredump.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: systemd-coredump deshabilitado
+  ansible.builtin.copy:
+    dest: /etc/systemd/coredump.conf.d/50-p3.conf
+    content: |
+      # Gestionado por Ansible
+      [Coredump]
+      Storage=none
+      ProcessSizeMax=0
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: umask 027 para usuarios nuevos
+  ansible.builtin.lineinfile:
+    path: /etc/login.defs
+    regexp: '^\s*UMASK\s+'
+    line: "UMASK           027"
+
+- name: Cierre de shells inactivas
+  ansible.builtin.copy:
+    dest: /etc/profile.d/p3-tmout.sh
+    content: |
+      # Gestionado por Ansible: cierra la sesión interactiva tras {{ p3_tmout }} s sin uso.
+      if [ "${TMOUT:-}" != "{{ p3_tmout }}" ]; then
+        TMOUT={{ p3_tmout }}
+        readonly TMOUT
+        export TMOUT
+      fi
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Aviso legal antes de autenticarse (SSH y consola)
+  ansible.builtin.template:
+    src: aviso_legal.j2
+    dest: "{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - /etc/issue
+    - /etc/issue.net
+
+- name: Mensaje del día vacío (no revelar información del sistema)
+  ansible.builtin.copy:
+    dest: /etc/motd
+    content: ""
+    owner: root
+    group: root
+    mode: "0644"
+
+# service_facts no lista los .socket; por eso se consulta systemctl directamente.
+- name: Unidades instaladas
+  ansible.builtin.command: systemctl list-unit-files --no-legend --plain --type=service,socket # noqa: command-instead-of-module
+  register: p3_unidades
+  changed_when: false
+
+- name: Deshabilitar y enmascarar servicios que no se usan
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+    masked: true
+  loop: "{{ p3_unidades_innecesarias }}"
+  when: p3_unidades.stdout is search('(?m)^' ~ (item | regex_escape) ~ '\s')
+
+- name: firewalld registra los paquetes rechazados (evidencia)
+  ansible.builtin.lineinfile:
+    path: /etc/firewalld/firewalld.conf
+    regexp: '^LogDenied='
+    line: LogDenied=unicast
+  notify: Recargar firewalld
+
+- name: Zona public con solo los puertos de la política de acceso (cap. 03)
+  ansible.builtin.template:
+    src: zona_public.xml.j2
+    dest: /etc/firewalld/zones/public.xml
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Recargar firewalld
+
+- name: firewalld activo
+  ansible.builtin.systemd_service:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Aplicar reglas de firewall ahora
+  ansible.builtin.meta: flush_handlers

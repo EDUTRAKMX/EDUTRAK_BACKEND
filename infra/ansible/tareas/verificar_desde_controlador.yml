@@ -1,0 +1,28 @@
+---
+# Pruebas negativas de acceso al bastión desde fuera (cap. 16). Usan tu llave de
+# PuTTYgen: aunque la llave sea correcta, sin contraseña + TOTP no se entra.
+- name: Parámetros de conexión
+  ansible.builtin.set_fact:
+    p3_cfg_ssh: "{{ hostvars[groups['bastion'][0]]['p3_ssh_config'] }}"
+    p3_admin_bastion: "{{ hostvars[groups['bastion'][0]]['p3_usuario_admin'] }}"
+
+- name: coriander con solo la llave NO entra (falta contraseña + TOTP)
+  ansible.builtin.command: >-
+    ssh -F {{ p3_cfg_ssh }} -o BatchMode=yes -o ControlMaster=no -o ControlPath=none
+    -l {{ p3_admin_bastion }} p3-bastion true
+  register: p3_prueba_coriander
+  changed_when: false
+  failed_when: >-
+    p3_prueba_coriander.rc == 0 or
+    p3_prueba_coriander.stderr is not search('Permission denied \(keyboard-interactive\)')
+
+- name: celery y root NO pueden entrar por SSH
+  ansible.builtin.command: >-
+    ssh -F {{ p3_cfg_ssh }} -o BatchMode=yes -o ControlMaster=no -o ControlPath=none
+    -l {{ item }} p3-bastion true
+  register: p3_prueba_denegada
+  changed_when: false
+  failed_when: p3_prueba_denegada.rc == 0 or p3_prueba_denegada.stderr is not search('Permission denied')
+  loop:
+    - "{{ hostvars[groups['bastion'][0]]['p3_usuario_sudoer_bastion'] }}"
+    - root

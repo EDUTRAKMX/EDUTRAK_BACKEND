@@ -1,0 +1,53 @@
+#cloud-config
+# Arranque mínimo: nombre del equipo, cuenta temporal de aprovisionamiento con tu
+# llave de PuTTYgen y sshd ya en el puerto de la guía. Todo lo demás lo hace Ansible.
+hostname: ${hostname}
+preserve_hostname: false
+ssh_pwauth: false
+disable_root: true
+# Llaves de host: solo Ed25519 y RSA (ECDSA no se usa).
+ssh_deletekeys: true
+ssh_genkeytypes: [ed25519, rsa]
+
+# Sin "default": no se crea el usuario rocky de la AMI.
+users:
+  - name: ${usuario}
+    gecos: Cuenta temporal de aprovisionamiento (Ansible)
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - ${llave_publica}
+
+write_files:
+  - path: /usr/local/sbin/p3-puerto-ssh.sh
+    owner: root:root
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      # Cambia el puerto de sshd con su etiqueta SELinux (ssh_port_t).
+      # Si algo falla, sshd se queda en el 22 (cerrado por el grupo de seguridad).
+      set -euo pipefail
+      PUERTO=${puerto_ssh}
+      for intento in $(seq 1 30); do
+        command -v semanage >/dev/null 2>&1 && break
+        dnf -y -q install policycoreutils-python-utils && break
+        echo "dnf falló (intento $intento); reintentando" >&2
+        sleep 10
+      done
+      if ! semanage port -l | awk '$1 == "ssh_port_t"' | grep -qw "$PUERTO"; then
+        semanage port -a -t ssh_port_t -p tcp "$PUERTO" || semanage port -m -t ssh_port_t -p tcp "$PUERTO"
+      fi
+      # Si la imagen trae firewalld activo, abrir el puerto nuevo antes de moverse.
+      if systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-port="$PUERTO/tcp"
+        firewall-cmd --reload
+      fi
+      install -o root -g root -m 0600 /dev/null /etc/ssh/sshd_config.d/00-p3-puerto.conf
+      printf 'Port %s\n' "$PUERTO" > /etc/ssh/sshd_config.d/00-p3-puerto.conf
+      sshd -t
+      systemctl restart sshd
+      echo "sshd escuchando en el puerto $PUERTO"
+
+runcmd:
+  - [bash, /usr/local/sbin/p3-puerto-ssh.sh]

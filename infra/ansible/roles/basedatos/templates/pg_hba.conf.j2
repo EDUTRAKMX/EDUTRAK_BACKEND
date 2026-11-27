@@ -1,0 +1,13 @@
+# {{ ansible_managed }}
+# Equivalente a las rich rules + la cuenta SQL de la guía (cap. 09), pero por IP exacta:
+# la cuenta de la aplicación solo desde Page-1 y Page-2; la de migraciones solo desde
+# {{ groups['web'][0] }} (allí corre "migrate", igual que "migrate --force" solo en Page-1).
+# TYPE    DATABASE          USER                          ADDRESS                 METHOD
+local     all               postgres                                              peer
+{% for ip in p3_ips_web %}
+hostssl   {{ p3_bd_nombre }}  {{ p3_bd_usuario_app }}  {{ ip }}/32  scram-sha-256
+{% endfor %}
+hostssl   {{ p3_bd_nombre }}  {{ p3_bd_usuario_migrador }}  {{ hostvars[groups['web'][0]]['p3_ip'] }}/32  scram-sha-256
+# Todo lo demás se rechaza explícitamente (incluido cualquier intento sin TLS).
+local     all               all                                                   reject
+host      all               all                           0.0.0.0/0               reject

@@ -1,0 +1,7 @@
+---
+p3_firewall_reglas:
+  # SQL solo desde ambos Pages (cap. 09); nunca 0.0.0.0/0.
+  - puerto: "{{ p3_puerto_bd }}"
+    origenes: "{{ p3_ips_web }}"
+  - puerto: "{{ p3_puerto_ssh }}"
+    origenes: ["{{ p3_ip_bastion }}"]

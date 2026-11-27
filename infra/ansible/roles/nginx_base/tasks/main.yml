@@ -1,0 +1,26 @@
+---
+- name: NGINX (sin Apache, cap. 05)
+  ansible.builtin.dnf:
+    name: nginx
+    state: present
+
+- name: Apache no debe estar instalado
+  ansible.builtin.dnf:
+    name: httpd
+    state: absent
+
+- name: nginx.conf mínimo (sin el server por defecto ni default.d)
+  ansible.builtin.template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/nginx -t -c %s
+  notify: Recargar nginx
+
+- name: SELinux - NGINX puede actuar como proxy (httpd_can_network_relay)
+  ansible.posix.seboolean:
+    name: httpd_can_network_relay
+    state: true
+    persistent: true

@@ -1,0 +1,25 @@
+#%PAM-1.0
+# {{ ansible_managed }}
+# Configuración definitiva de "su" en el bastión (guía, cap. 15-16):
+#  - root conserva la excepción pam_rootok;
+#  - solo {{ p3_usuario_admin }} puede invocar su (use_uid = quien ejecuta su);
+#  - el único destino permitido es {{ p3_usuario_sudoer_bastion }};
+#  - contraseña con pam_unix SIN nullok (alternativa explícita del cap. 16, no depende
+#    de system-auth) y después el TOTP propio de {{ p3_usuario_sudoer_bastion }}.
+# Retirado: pam_xauth (no hay X11).
+auth       required     pam_env.so
+auth       sufficient   pam_rootok.so
+auth       requisite    pam_succeed_if.so use_uid user = {{ p3_usuario_admin }}
+auth       requisite    pam_succeed_if.so user = {{ p3_usuario_sudoer_bastion }}
+auth       required     pam_faillock.so preauth
+auth       [success=1 default=bad] pam_unix.so
+auth       [default=die] pam_faillock.so authfail
+auth       required     pam_faillock.so authsucc
+auth       required     pam_google_authenticator.so secret=${HOME}/.otp/.google_authenticator noskewadj
+auth       include      postlogin
+account    sufficient   pam_succeed_if.so uid = 0 use_uid quiet
+account    required     pam_faillock.so
+account    include      system-auth
+password   include      system-auth
+session    include      system-auth
+session    include      postlogin

@@ -1,0 +1,89 @@
+---
+# Capítulos 13-14: celery guarda las llaves privadas (RSA 4096 con frase de paso)
+# hacia cada nodo; coriander no puede leerlas. ~/.ssh/config y known_hosts quedan
+# listos con las huellas reales de cada nodo (sin aceptar llaves a ciegas).
+
+- name: Librerías para generar llaves OpenSSH con frase de paso (bcrypt viene de EPEL)
+  ansible.builtin.dnf:
+    name:
+      - python3-cryptography
+      - python3-bcrypt
+    state: present
+
+- name: Llaves por nodo para celery
+  ansible.builtin.set_fact:
+    p3_llaves_celery: >-
+      {{ p3_llaves_celery | default([]) + [{
+           'host': item,
+           'alias': hostvars[item]['p3_clave'],
+           'archivo': hostvars[item]['p3_clave'] ~ '_rsa',
+           'ip': hostvars[item]['p3_ip'],
+           'puerto': hostvars[item]['p3_puerto_ssh'],
+           'usuario': hostvars[item]['p3_usuario_admin'] }] }}
+  loop: "{{ groups['internos'] }}"
+
+- name: ~/.ssh de celery (700)
+  ansible.builtin.file:
+    path: "/home/{{ p3_usuario_sudoer_bastion }}/.ssh"
+    state: directory
+    owner: "{{ p3_usuario_sudoer_bastion }}"
+    group: "{{ p3_usuario_sudoer_bastion }}"
+    mode: "0700"
+
+- name: Llave RSA 4096 con frase de paso hacia cada nodo (cap. 13)
+  community.crypto.openssh_keypair:
+    path: "/home/{{ p3_usuario_sudoer_bastion }}/.ssh/{{ item.archivo }}"
+    type: rsa
+    size: 4096
+    passphrase: "{{ p3_secretos.celery_llaves_passphrase }}"
+    private_key_format: ssh
+    backend: cryptography
+    comment: "{{ p3_usuario_sudoer_bastion }}@{{ inventory_hostname }} -> {{ item.usuario }}@{{ item.host }}"
+    owner: "{{ p3_usuario_sudoer_bastion }}"
+    group: "{{ p3_usuario_sudoer_bastion }}"
+    mode: "0600"
+  loop: "{{ p3_llaves_celery }}"
+  loop_control:
+    label: "{{ item.archivo }}"
+  register: p3_llaves
+
+- name: Guardar la parte pública de cada llave para autorizarla en su nodo
+  ansible.builtin.set_fact:
+    p3_llaves_publicas: "{{ dict(p3_llaves.results | map(attribute='item') | map(attribute='host') | zip(p3_llaves.results | map(attribute='public_key'))) }}"
+
+- name: ~/.ssh/config de celery (cap. 13)
+  ansible.builtin.template:
+    src: celery_ssh_config.j2
+    dest: "/home/{{ p3_usuario_sudoer_bastion }}/.ssh/config"
+    owner: "{{ p3_usuario_sudoer_bastion }}"
+    group: "{{ p3_usuario_sudoer_bastion }}"
+    mode: "0600"
+
+- name: known_hosts con las huellas Ed25519 reales de cada nodo (cap. 14)
+  ansible.builtin.template:
+    src: celery_known_hosts.j2
+    dest: "/home/{{ p3_usuario_sudoer_bastion }}/.ssh/known_hosts"
+    owner: "{{ p3_usuario_sudoer_bastion }}"
+    group: "{{ p3_usuario_sudoer_bastion }}"
+    mode: "0600"
+
+- name: Etiquetas SELinux de ~/.ssh de celery
+  ansible.builtin.command: restorecon -RvF /home/{{ p3_usuario_sudoer_bastion }}/.ssh
+  register: p3_restorecon_ssh
+  changed_when: p3_restorecon_ssh.stdout | length > 0
+
+- name: coriander no conserva llaves privadas ni config hacia los nodos (cap. 14)
+  ansible.builtin.find:
+    paths: "/home/{{ p3_usuario_admin }}/.ssh"
+    excludes:
+      - authorized_keys
+      - known_hosts
+  register: p3_restos_coriander
+
+- name: Retirar llaves o config que hubieran quedado en coriander
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ p3_restos_coriander.files }}"
+  loop_control:
+    label: "{{ item.path }}"

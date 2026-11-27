@@ -1,0 +1,18 @@
+---
+p3_pg_version: 16
+p3_pg_datos: "/var/lib/pgsql/{{ p3_pg_version }}/data"
+p3_pg_bin: "/usr/pgsql-{{ p3_pg_version }}/bin"
+p3_pg_servicio: "postgresql-{{ p3_pg_version }}"
+p3_pg_socket: /run/postgresql
+
+# Repositorio oficial PGDG (equivalente a "instalar MariaDB desde el sitio oficial").
+p3_pg_repo_rpm: "https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm"
+p3_pg_gpg_url: "https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL"
+# Huella publicada por el equipo de PGDG; se verifica antes de importar la llave.
+p3_pg_gpg_huella: "D4BF08AE67A0B4C7A1DBCCD240BCA2B408B40D20"
+
+p3_bd_nombre: edutrak
+# Dos cuentas (recomendación del cap. 20): la de migraciones es dueña del esquema y
+# la de la aplicación solo lee y escribe datos (sin DDL).
+p3_bd_usuario_migrador: edutrak_migrator
+p3_bd_usuario_app: edutrak_app

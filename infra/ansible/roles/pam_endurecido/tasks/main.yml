@@ -1,0 +1,163 @@
+---
+# PAM: solo lo que este laboratorio usa. Perfil local de authselect (sin sssd,
+# fprintd ni systemd-homed), sin "nullok", faillock, calidad de contraseñas y
+# TOTP con pam_google_authenticator en sshd y en su (cap. 14-16).
+
+- name: Paquetes de PAM
+  ansible.builtin.dnf:
+    name:
+      - authselect
+      - google-authenticator
+      - libpwquality
+    state: present
+
+- name: Respaldo de /etc/pam.d antes de modificarlo (una sola vez)
+  ansible.builtin.command: cp -a /etc/pam.d {{ p3_respaldos }}/pam.d
+  args:
+    creates: "{{ p3_respaldos }}/pam.d"
+
+- name: Perfiles de authselect disponibles
+  ansible.builtin.command: authselect list
+  register: p3_authselect_lista
+  changed_when: false
+
+- name: Elegir el perfil de cuentas locales ("local" en versiones nuevas, "minimal" antes)
+  ansible.builtin.set_fact:
+    p3_authselect_perfil: "{{ 'local' if p3_authselect_lista.stdout is search('(?m)^- local\\s') else 'minimal' }}"
+
+- name: Funciones que ofrece el perfil
+  ansible.builtin.command: authselect list-features {{ p3_authselect_perfil }}
+  register: p3_authselect_funciones_disponibles
+  changed_when: false
+
+- name: Funciones deseadas (faillock, historial de contraseñas, sin nullok)
+  ansible.builtin.set_fact:
+    p3_authselect_funciones: "{{ ['with-faillock', 'with-pwhistory', 'without-nullok'] | intersect(p3_authselect_funciones_disponibles.stdout_lines) }}"
+
+- name: El perfil debe permitir quitar nullok y activar faillock
+  ansible.builtin.assert:
+    that:
+      - "'without-nullok' in p3_authselect_funciones"
+      - "'with-faillock' in p3_authselect_funciones"
+    fail_msg: "authselect {{ p3_authselect_perfil }} no ofrece without-nullok/with-faillock."
+    quiet: true
+
+- name: Perfil actual de authselect
+  ansible.builtin.command: authselect current --raw
+  register: p3_authselect_actual
+  changed_when: false
+  failed_when: false
+
+- name: Seleccionar perfil local con faillock y sin nullok (estrategia de perfil, cap. 16)
+  ansible.builtin.command: >-
+    authselect select {{ p3_authselect_perfil }} {{ p3_authselect_funciones | join(' ') }} --force
+  when: (p3_authselect_actual.stdout | default('')).split() | sort != ([p3_authselect_perfil] + p3_authselect_funciones) | sort
+  changed_when: true
+
+- name: Bloqueo temporal tras intentos fallidos (pam_faillock)
+  ansible.builtin.template:
+    src: faillock.conf.j2
+    dest: /etc/security/faillock.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Calidad mínima de contraseñas (pam_pwquality)
+  ansible.builtin.template:
+    src: pwquality.conf.j2
+    dest: /etc/security/pwquality.conf.d/50-p3.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Historial de contraseñas (pam_pwhistory)
+  ansible.builtin.copy:
+    dest: /etc/security/pwhistory.conf
+    content: |
+      # {{ ansible_managed }}
+      remember = 5
+      retry = 3
+      enforce_for_root
+    owner: root
+    group: root
+    mode: "0644"
+  when: "'with-pwhistory' in p3_authselect_funciones"
+
+- name: PAM de sshd - llave (sshd) + contraseña + TOTP; sin módulos que no se usan
+  ansible.builtin.template:
+    src: pam_sshd.j2
+    dest: /etc/pam.d/sshd
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: PAM de su (bastión - configuración definitiva del cap. 15)
+  ansible.builtin.template:
+    src: "{{ 'pam_su_bastion.j2' if inventory_hostname in groups['bastion'] else 'pam_su.j2' }}"
+    dest: /etc/pam.d/su
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: su-l debe delegar en su (cap. 16)
+  ansible.builtin.lineinfile:
+    path: /etc/pam.d/su-l
+    regexp: '^auth\s+include\s+su\s*$'
+    line: "auth            include         su"
+    state: present
+    insertafter: '^#%PAM-1.0'
+
+- name: Servicios PAM sin uso (telnet/rlogin) niegan todo y lo registran
+  ansible.builtin.copy:
+    dest: /etc/pam.d/remote
+    content: |
+      #%PAM-1.0
+      # {{ ansible_managed }}
+      # No hay telnet ni rlogin en este laboratorio: cualquier uso se niega y se registra.
+      auth       required     pam_warn.so
+      auth       required     pam_deny.so
+      account    required     pam_deny.so
+      password   required     pam_deny.so
+      session    required     pam_deny.so
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: chfn y chsh solo para root
+  ansible.builtin.copy:
+    dest: "/etc/pam.d/{{ item }}"
+    content: |
+      #%PAM-1.0
+      # {{ ansible_managed }}
+      auth       sufficient   pam_rootok.so
+      auth       required     pam_warn.so
+      auth       required     pam_deny.so
+      account    include      system-auth
+      password   required     pam_deny.so
+      session    include      system-auth
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - chfn
+    - chsh
+
+- name: Leer la pila system-auth/password-auth resultante
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  register: p3_pilas_pam
+  loop:
+    - /etc/pam.d/system-auth
+    - /etc/pam.d/password-auth
+
+- name: Ninguna pila permite contraseñas vacías (sin nullok) y ambas exigen pam_unix
+  ansible.builtin.assert:
+    that:
+      - (item.content | b64decode) is not search('(?m)^auth\s.*\snullok(\s|$)')
+      - (item.content | b64decode) is search('(?m)^auth\s+\S+\s+pam_unix\.so')
+      - (item.content | b64decode) is search('(?m)^auth\s+required\s+pam_faillock\.so\s+preauth')
+    fail_msg: "{{ item.item }} no quedó como se esperaba."
+    quiet: true
+  loop: "{{ p3_pilas_pam.results }}"
+  loop_control:
+    label: "{{ item.item }}"

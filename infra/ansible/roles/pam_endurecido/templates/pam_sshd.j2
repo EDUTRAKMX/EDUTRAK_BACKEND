@@ -1,0 +1,23 @@
+#%PAM-1.0
+# {{ ansible_managed }}
+# sshd exige: publickey (RSA 4096, lo valida sshd) y después keyboard-interactive:pam,
+# que pide la contraseña (password-auth: faillock + pam_unix sin nullok) y el TOTP.
+#
+# Retirado respecto al archivo de Rocky porque este laboratorio no lo usa:
+#   pam_namespace  (no hay directorios polinstanciados)
+#   pam_motd       (sin mensaje del día; el aviso legal va en el Banner de sshd)
+auth       substack     password-auth
+auth       required     pam_google_authenticator.so secret=${HOME}/.otp/.google_authenticator noskewadj
+auth       include      postlogin
+account    required     pam_sepermit.so
+account    required     pam_nologin.so
+account    include      password-auth
+password   include      password-auth
+# pam_selinux.so close debe ser la primera regla de sesión
+session    required     pam_selinux.so close
+session    required     pam_loginuid.so
+# pam_selinux.so open solo debe ir seguido de reglas que corren en el contexto del usuario
+session    required     pam_selinux.so open env_params
+session    optional     pam_keyinit.so force revoke
+session    include      password-auth
+session    include      postlogin

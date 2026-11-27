@@ -1,0 +1,16 @@
+---
+# Usuario de servicio sin inicio de sesión que ejecuta la API (cap. 06).
+# Mismo UID/GID en ambos Pages: el EFS compartido (NFS) identifica por número y la
+# API crea archivos 0600; con UID distintos Page-2 no podría leer lo que subió Page-1.
+p3_usuarios_servicio:
+  page-1: broccoli
+  page-2: spinach
+p3_usuario_servicio: "{{ p3_usuarios_servicio[inventory_hostname] | default('edutrak') }}"
+p3_uid_servicio: 2601
+
+p3_firewall_reglas:
+  # HTTP privado: solo el balanceador (cap. 03, "No abrir HTTP al público en los Pages").
+  - puerto: 80
+    origenes: ["{{ p3_ip_balanceador }}"]
+  - puerto: "{{ p3_puerto_ssh }}"
+    origenes: ["{{ p3_ip_bastion }}"]

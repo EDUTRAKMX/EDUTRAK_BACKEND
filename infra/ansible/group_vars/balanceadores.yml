@@ -1,0 +1,6 @@
+---
+p3_firewall_reglas:
+  - puerto: 80
+    origenes: []
+  - puerto: "{{ p3_puerto_ssh }}"
+    origenes: ["{{ p3_ip_bastion }}"]

@@ -1,0 +1,15 @@
+---
+# SSHD_Conexion (guía: SSH-Conection). Solo coriander entra por SSH; celery es el
+# sudoer local que guarda las llaves privadas hacia los demás nodos (cap. 13-15).
+p3_usuarios_humanos:
+  - nombre: "{{ p3_usuario_admin }}"
+    ssh: true
+    sudo: false
+  - nombre: "{{ p3_usuario_sudoer_bastion }}"
+    ssh: false
+    sudo: true
+
+p3_firewall_reglas:
+  # El origen (IP de administración) lo restringe el grupo de seguridad de AWS.
+  - puerto: "{{ p3_puerto_ssh }}"
+    origenes: []

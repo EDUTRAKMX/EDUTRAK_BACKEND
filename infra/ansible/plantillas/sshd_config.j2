@@ -1,0 +1,100 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# {{ ansible_managed }}
+# Endurecimiento SSH - Práctica 3 - {{ p3_nombre }} ({{ p3_rol }})
+# Archivo completo: NO incluye /etc/ssh/sshd_config.d/*.conf (los fragmentos de Rocky y
+# cloud-init se movieron a {{ p3_respaldos }}/ssh). Cada "no" corresponde a una función
+# que este laboratorio no usa.
+{% set internos = groups['internos'] | map('extract', hostvars) | list %}
+{% if inventory_hostname in groups['bastion'] %}
+{%   set permitidos = p3_usuarios_humanos | selectattr('ssh') | map(attribute='nombre') | list %}
+{% else %}
+{%   set permitidos = p3_usuarios_humanos | selectattr('ssh') | map(attribute='nombre') | map('regex_replace', '$', '@' ~ p3_ip_bastion) | list %}
+{% endif %}
+{% if p3_ssh_aprovisionamiento | bool %}
+{%   set permitidos = permitidos + [p3_usuario_aprovisionamiento ~ ('' if inventory_hostname in groups['bastion'] else '@' ~ p3_ip_bastion)] %}
+{% endif %}
+
+## Red: puerto de la guía y solo la IP privada (AWS traduce la pública a esta)
+Port {{ p3_puerto_ssh }}
+AddressFamily inet
+ListenAddress {{ p3_ip }}
+
+## Llaves de host: Ed25519 y RSA {{ p3_ssh_longitud_rsa }}. ECDSA retirada.
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+## Criptografía: sin SHA-1, sin CBC, sin curvas NIST y sin ChaCha20 (Terrapin)
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+PubkeyAcceptedAlgorithms rsa-sha2-512,rsa-sha2-256
+{% if p3_ssh_required_rsa_size | default(true) | bool %}
+RequiredRSASize {{ p3_ssh_longitud_rsa }}
+{% endif %}
+RekeyLimit 512M 1h
+
+## Registro (VERBOSE anota la huella de la llave usada)
+SyslogFacility AUTHPRIV
+LogLevel VERBOSE
+
+## Autenticación: llave RSA + contraseña + TOTP (PAM). Nada más.
+LoginGraceTime 60
+PermitRootLogin no
+StrictModes yes
+MaxAuthTries 4
+MaxSessions 3
+MaxStartups 10:30:60
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+AuthenticationMethods publickey,keyboard-interactive:pam
+KbdInteractiveAuthentication yes
+UsePAM yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+HostbasedAuthentication no
+IgnoreRhosts yes
+IgnoreUserKnownHosts yes
+GSSAPIAuthentication no
+KerberosAuthentication no
+AllowUsers {{ permitidos | join(' ') }}
+DenyUsers root
+
+## Funciones que no se usan: deshabilitadas
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTunnel no
+PermitUserEnvironment no
+PermitUserRC no
+Compression no
+UseDNS no
+TCPKeepAlive no
+PrintMotd no
+PrintLastLog yes
+VersionAddendum none
+Banner /etc/issue.net
+ClientAliveInterval 300
+ClientAliveCountMax 2
+{% if p3_ssh_sftp | bool %}
+Subsystem sftp internal-sftp
+{% else %}
+# Sin "Subsystem sftp": nadie lo usa (Ansible copia archivos por "piped").
+{% endif %}
+{% if p3_ssh_aprovisionamiento | bool %}
+
+## Cuenta temporal de aprovisionamiento: solo llave, sin terminal.
+## Se elimina de este archivo al ejecutar el pipeline con bloquear_aprovisionamiento.
+Match User {{ p3_usuario_aprovisionamiento }}
+    AuthenticationMethods publickey
+    PermitTTY no
+    MaxSessions 10
+{%   if inventory_hostname in groups['bastion'] %}
+    # Único reenvío permitido: el salto (ProxyJump) a los puertos SSH internos.
+    AllowTcpForwarding local
+    PermitOpen {% for h in internos %}{{ h.p3_ip }}:{{ h.p3_puerto_ssh }}{{ ' ' if not loop.last else '' }}{% endfor %}
+
+{%   endif %}
+{% endif %}

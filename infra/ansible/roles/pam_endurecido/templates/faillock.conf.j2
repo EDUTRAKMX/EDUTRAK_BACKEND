@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+# 5 fallos en 15 min bloquean la cuenta 15 min. root no se bloquea (consola de rescate).
+dir = /var/run/faillock
+audit
+silent
+deny = 5
+fail_interval = 900
+unlock_time = 900

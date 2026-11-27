@@ -1,0 +1,267 @@
+---
+# Capítulos 05-07, 10-11 y 17 adaptados a la API EDUTRAK (Go): usuario de servicio sin
+# login, binarios de solo lectura, SELinux, NGINX solo en la IP privada y solo para el
+# balanceador, sesión válida en ambos nodos (JWT con la misma clave) y evidencias
+# compartidas.
+
+- name: Comprobar que el pipeline compiló la API
+  ansible.builtin.stat:
+    path: "{{ p3_app_binarios }}/{{ item }}"
+  register: p3_binarios
+  delegate_to: localhost
+  become: false
+  loop: [api, migrate, seed]
+
+- name: Los binarios deben existir
+  ansible.builtin.assert:
+    that: p3_binarios.results | map(attribute='stat.exists') | min
+    fail_msg: "Compila la API (go build) y pasa -e p3_app_binarios=<dir con api, migrate y seed>."
+    quiet: true
+
+- name: Producción exige redes de asistencia (ALLOWED_NETWORKS)
+  ansible.builtin.assert:
+    that: p3_app_redes_asistencia | length > 0
+    fail_msg: "Define p3_app_redes_asistencia (CIDR de la red institucional); la API no arranca sin ella."
+    quiet: true
+
+- name: Paquetes
+  ansible.builtin.dnf:
+    name:
+      - acl
+      - nfs-utils
+    state: present
+
+# --- Usuario de servicio (cap. 06) -------------------------------------------------
+- name: Grupo del servicio
+  ansible.builtin.group:
+    name: "{{ p3_usuario_servicio }}"
+    gid: "{{ p3_uid_servicio }}"
+    system: true
+
+- name: Usuario del servicio sin inicio de sesión
+  ansible.builtin.user:
+    name: "{{ p3_usuario_servicio }}"
+    uid: "{{ p3_uid_servicio }}"
+    group: "{{ p3_usuario_servicio }}"
+    system: true
+    shell: /sbin/nologin
+    home: "{{ p3_app_estado }}"
+    create_home: false
+    password_lock: true
+    comment: "Servicio EDUTRAK ({{ p3_nombre }})"
+
+# --- Binarios de solo lectura y SELinux (cap. 07) ---------------------------------
+- name: Directorios de la aplicación
+  ansible.builtin.file:
+    path: "{{ item.ruta }}"
+    state: directory
+    owner: root
+    group: "{{ item.grupo }}"
+    mode: "{{ item.modo }}"
+  loop:
+    - { ruta: "{{ p3_app_raiz }}", grupo: root, modo: "0755" }
+    - { ruta: "{{ p3_app_raiz }}/releases", grupo: root, modo: "0755" }
+    - { ruta: "{{ p3_app_raiz }}/releases/{{ p3_app_version }}", grupo: root, modo: "0755" }
+    - { ruta: "{{ p3_app_config }}", grupo: root, modo: "0755" }
+    - { ruta: "{{ p3_app_estado }}", grupo: "{{ p3_usuario_servicio }}", modo: "0750" }
+  loop_control:
+    label: "{{ item.ruta }}"
+
+- name: SELinux - los binarios son ejecutables de sistema (bin_t)
+  community.general.sefcontext:
+    target: "{{ p3_app_raiz }}/releases(/.*)?"
+    setype: bin_t
+    state: present
+
+- name: Copiar binarios (root, 0755; el servicio no puede modificarlos)
+  ansible.builtin.copy:
+    src: "{{ p3_app_binarios }}/{{ item }}"
+    dest: "{{ p3_app_raiz }}/releases/{{ p3_app_version }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [api, migrate, seed]
+  notify: Reiniciar API
+
+- name: Etiquetas SELinux de los binarios
+  ansible.builtin.command: restorecon -RvF {{ p3_app_raiz }}
+  register: p3_restorecon_app
+  changed_when: p3_restorecon_app.stdout | length > 0
+
+- name: Versión activa
+  ansible.builtin.file:
+    src: "{{ p3_app_raiz }}/releases/{{ p3_app_version }}"
+    dest: "{{ p3_app_raiz }}/actual"
+    state: link
+    force: true
+  notify: Reiniciar API
+
+# --- Configuración (cap. 10): .env fuera del código y legible solo por root ---------
+- name: Certificado de la CA de la base de datos (verify-full)
+  ansible.builtin.copy:
+    content: "{{ hostvars[groups['bd'][0]]['p3_bd_ca_pem'] }}"
+    dest: "{{ p3_app_config }}/bd-ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reiniciar API
+
+- name: Variables de entorno de la API (systemd las lee como root)
+  ansible.builtin.template:
+    src: edutrak.env.j2
+    dest: "{{ p3_app_config }}/edutrak.env"
+    owner: root
+    group: root
+    mode: "0600"
+  diff: false
+  no_log: true
+  notify: Reiniciar API
+
+# --- Evidencias compartidas (EFS) --------------------------------------------------
+- name: Montar el EFS de evidencias
+  ansible.posix.mount:
+    src: "{{ p3_efs_ip }}:/"
+    path: "{{ p3_app_evidencias }}"
+    fstype: nfs4
+    opts: nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev,nosuid,nodev,noexec
+    state: mounted
+  when: p3_efs_ip | length > 0
+
+- name: Evidencias solo para el usuario de servicio (mismo UID en ambos Pages)
+  ansible.builtin.file:
+    path: "{{ p3_app_evidencias }}"
+    state: directory
+    owner: "{{ p3_uid_servicio }}"
+    group: "{{ p3_uid_servicio }}"
+    mode: "0700"
+
+# --- Servicio systemd con sandbox ---------------------------------------------------
+- name: Unidad systemd de la API
+  ansible.builtin.template:
+    src: edutrak-api.service.j2
+    dest: /etc/systemd/system/edutrak-api.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reiniciar API
+
+- name: Recargar systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# --- Migraciones solo en el primer Page (cap. 10: "SOLO Page-1") -------------------
+# Se ejecutan con systemd-run y un archivo de entorno temporal (root, 0600) para que
+# las contraseñas no aparezcan en la línea de comandos ni en "ps".
+- name: Migraciones y primer ADMIN (solo en {{ groups['web'][0] }})
+  when: inventory_hostname == groups['web'][0]
+  block:
+    - name: Entorno temporal para las migraciones (cuenta de migraciones)
+      ansible.builtin.template:
+        src: tarea.env.j2
+        dest: "{{ p3_app_config }}/tarea.env"
+        owner: root
+        group: root
+        mode: "0600"
+      vars:
+        p3_tarea_entorno: "{{ p3_app_entorno_comun | combine({'DATABASE_URL': p3_app_url_bd_migrador}) }}"
+      diff: false
+      no_log: true
+
+    - name: Aplicar migraciones
+      ansible.builtin.command: >-
+        systemd-run --quiet --wait --pipe --collect
+        --uid={{ p3_usuario_servicio }} --gid={{ p3_usuario_servicio }}
+        -p EnvironmentFile={{ p3_app_config }}/tarea.env
+        -p WorkingDirectory={{ p3_app_estado }}
+        {{ p3_app_raiz }}/actual/migrate
+      register: p3_migraciones
+      changed_when: "'migration applied' in p3_migraciones.stderr"
+
+    - name: Entorno temporal para crear el primer ADMIN
+      ansible.builtin.template:
+        src: tarea.env.j2
+        dest: "{{ p3_app_config }}/tarea.env"
+        owner: root
+        group: root
+        mode: "0600"
+      vars:
+        p3_tarea_entorno: >-
+          {{ p3_app_entorno_comun | combine({'DATABASE_URL': p3_app_url_bd,
+             'SEED_ADMIN_NUMBER': p3_app_admin_numero,
+             'SEED_ADMIN_PASSWORD': p3_secretos.app_admin_password}) }}
+      when: p3_app_crear_admin | bool
+      diff: false
+      no_log: true
+
+    - name: Crear el primer ADMIN de la API (idempotente)
+      ansible.builtin.command: >-
+        systemd-run --quiet --wait --pipe --collect
+        --uid={{ p3_usuario_servicio }} --gid={{ p3_usuario_servicio }}
+        -p EnvironmentFile={{ p3_app_config }}/tarea.env
+        -p WorkingDirectory={{ p3_app_estado }}
+        {{ p3_app_raiz }}/actual/seed
+      register: p3_seed
+      changed_when: "'admin created' in p3_seed.stdout"
+      when: p3_app_crear_admin | bool
+
+  always:
+    - name: Borrar el entorno temporal
+      ansible.builtin.file:
+        path: "{{ p3_app_config }}/tarea.env"
+        state: absent
+
+- name: API activa
+  ansible.builtin.systemd_service:
+    name: edutrak-api
+    enabled: true
+    state: started
+
+# --- NGINX del Page (cap. 11) ---------------------------------------------------------
+- name: Directorio del identificador del nodo
+  ansible.builtin.file:
+    path: /usr/share/nginx/p3
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Identificador visible del nodo (cap. 17)
+  ansible.builtin.copy:
+    dest: /usr/share/nginx/p3/nodo
+    content: "{{ p3_nombre }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: sitio.conf - solo la IP privada y solo el balanceador
+  ansible.builtin.template:
+    src: sitio.conf.j2
+    dest: /etc/nginx/conf.d/sitio.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Recargar nginx
+
+- name: Ningún balanceador.conf copiado por error en un Page (cap. 11)
+  ansible.builtin.file:
+    path: /etc/nginx/conf.d/balanceador.conf
+    state: absent
+  notify: Recargar nginx
+
+- name: NGINX activo
+  ansible.builtin.systemd_service:
+    name: nginx
+    enabled: true
+    state: started
+
+- name: Aplicar cambios pendientes (API y NGINX)
+  ansible.builtin.meta: flush_handlers
+
+- name: La API responde y llega a la base de datos (/readyz)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ p3_app_puerto }}/readyz"
+    status_code: 200
+  register: p3_readyz
+  retries: 12
+  delay: 5
+  until: p3_readyz.status == 200

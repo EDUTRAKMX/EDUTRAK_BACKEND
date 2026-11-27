@@ -1,0 +1,275 @@
+---
+# Capítulos 08-09 adaptados a PostgreSQL: droplet propio, repositorio oficial,
+# escucha solo en 127.0.0.1 y la IP privada, puerto {{ p3_puerto_bd }}, SELinux,
+# solo los Pages pueden conectarse y cuentas con el mínimo privilegio.
+
+- name: Importar la llave GPG de PGDG verificando su huella
+  ansible.builtin.rpm_key:
+    key: "{{ p3_pg_gpg_url }}"
+    fingerprint: "{{ p3_pg_gpg_huella }}"
+    state: present
+
+- name: Repositorio oficial de PostgreSQL (PGDG)
+  ansible.builtin.dnf:
+    name: "{{ p3_pg_repo_rpm }}"
+    state: present
+
+- name: Desactivar el módulo postgresql de AppStream (usar el de PGDG)
+  ansible.builtin.command: dnf -qy module disable postgresql
+  args:
+    creates: /etc/dnf/modules.d/postgresql.module
+
+- name: Instalar PostgreSQL {{ p3_pg_version }}
+  ansible.builtin.dnf:
+    name:
+      - "postgresql{{ p3_pg_version }}-server"
+      - "postgresql{{ p3_pg_version }}"
+      - python3-psycopg2
+      - python3-cryptography
+    state: present
+
+- name: Inicializar el clúster (scram-sha-256, checksums, UTF-8)
+  ansible.builtin.command: "{{ p3_pg_bin }}/postgresql-{{ p3_pg_version }}-setup initdb"
+  environment:
+    PGSETUP_INITDB_OPTIONS: "--auth-local=peer --auth-host=scram-sha-256 --data-checksums --encoding=UTF8 --locale=C.UTF-8"
+  args:
+    creates: "{{ p3_pg_datos }}/PG_VERSION"
+
+# --- TLS: los Pages verifican el certificado (sslmode=verify-full) -----------------
+- name: Directorios de la CA privada y de TLS
+  ansible.builtin.file:
+    path: "{{ item.ruta }}"
+    state: directory
+    owner: "{{ item.dueno }}"
+    group: "{{ item.dueno }}"
+    mode: "0700"
+  loop:
+    - { ruta: /root/p3-ca, dueno: root }
+    - { ruta: "{{ p3_pg_datos }}/tls", dueno: postgres }
+
+- name: Llave de la CA privada del laboratorio
+  community.crypto.openssl_privatekey:
+    path: /root/p3-ca/ca.key
+    type: RSA
+    size: 4096
+    mode: "0600"
+
+- name: Solicitud de la CA
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: /root/p3-ca/ca.key
+    common_name: "{{ p3_proyecto }} CA de base de datos"
+    use_common_name_for_san: false
+    basic_constraints:
+      - "CA:TRUE"
+    basic_constraints_critical: true
+    key_usage:
+      - keyCertSign
+      - cRLSign
+    key_usage_critical: true
+  register: p3_ca_csr
+  changed_when: false
+
+- name: Certificado de la CA (autofirmado, 10 años)
+  community.crypto.x509_certificate:
+    path: /root/p3-ca/ca.crt
+    csr_content: "{{ p3_ca_csr.csr }}"
+    privatekey_path: /root/p3-ca/ca.key
+    provider: selfsigned
+    selfsigned_not_after: "+3650d"
+    mode: "0644"
+
+- name: Llave TLS del servidor PostgreSQL
+  community.crypto.openssl_privatekey:
+    path: "{{ p3_pg_datos }}/tls/servidor.key"
+    type: RSA
+    size: 4096
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Reiniciar PostgreSQL
+
+- name: Solicitud del certificado del servidor (SAN = IP privada)
+  community.crypto.openssl_csr_pipe:
+    privatekey_path: "{{ p3_pg_datos }}/tls/servidor.key"
+    common_name: "{{ p3_ip }}"
+    subject_alt_name:
+      - "IP:{{ p3_ip }}"
+      - "DNS:{{ inventory_hostname }}"
+    extended_key_usage:
+      - serverAuth
+  register: p3_servidor_csr
+  changed_when: false
+
+- name: Certificado del servidor firmado por la CA
+  community.crypto.x509_certificate:
+    path: "{{ p3_pg_datos }}/tls/servidor.crt"
+    csr_content: "{{ p3_servidor_csr.csr }}"
+    provider: ownca
+    ownca_path: /root/p3-ca/ca.crt
+    ownca_privatekey_path: /root/p3-ca/ca.key
+    ownca_not_after: "+825d"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Reiniciar PostgreSQL
+
+# --- Configuración ---------------------------------------------------------------
+- name: Respaldo de postgresql.conf y pg_hba.conf originales
+  ansible.builtin.command: cp -an {{ p3_pg_datos }}/postgresql.conf {{ p3_pg_datos }}/pg_hba.conf {{ p3_respaldos }}/
+  args:
+    creates: "{{ p3_respaldos }}/pg_hba.conf"
+
+- name: Directorio conf.d
+  ansible.builtin.file:
+    path: "{{ p3_pg_datos }}/conf.d"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Cargar conf.d desde postgresql.conf
+  ansible.builtin.lineinfile:
+    path: "{{ p3_pg_datos }}/postgresql.conf"
+    regexp: "^#?include_dir\\s*="
+    line: "include_dir = 'conf.d'"
+  notify: Reiniciar PostgreSQL
+
+- name: Escucha, puerto, TLS y registro (equivalente a z-security.cnf)
+  ansible.builtin.template:
+    src: 10-p3-seguridad.conf.j2
+    dest: "{{ p3_pg_datos }}/conf.d/10-p3-seguridad.conf"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Reiniciar PostgreSQL
+
+- name: pg_hba.conf - solo los Pages, solo TLS, solo scram-sha-256
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ p3_pg_datos }}/pg_hba.conf"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Recargar PostgreSQL
+
+- name: SELinux - puerto de la base de datos como postgresql_port_t
+  community.general.seport:
+    ports: "{{ p3_puerto_bd }}"
+    proto: tcp
+    setype: postgresql_port_t
+    state: present
+
+- name: PostgreSQL activo
+  ansible.builtin.systemd_service:
+    name: "{{ p3_pg_servicio }}"
+    enabled: true
+    state: started
+
+- name: Aplicar configuración pendiente
+  ansible.builtin.meta: flush_handlers
+
+# --- Cuentas, base y privilegios ---------------------------------------------------
+- name: Cuentas de PostgreSQL (sin superusuario, sin crear bases ni roles)
+  community.postgresql.postgresql_user:
+    name: "{{ item.nombre }}"
+    password: "{{ item.password }}"
+    role_attr_flags: NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+  loop:
+    - { nombre: "{{ p3_bd_usuario_migrador }}", password: "{{ p3_secretos.bd_migrador_password }}" }
+    - { nombre: "{{ p3_bd_usuario_app }}", password: "{{ p3_secretos.bd_app_password }}" }
+  loop_control:
+    label: "{{ item.nombre }}"
+  no_log: true
+
+- name: Base de datos de la aplicación (dueño = cuenta de migraciones)
+  community.postgresql.postgresql_db:
+    name: "{{ p3_bd_nombre }}"
+    owner: "{{ p3_bd_usuario_migrador }}"
+    encoding: UTF-8
+    template: template0
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+
+- name: Nadie más puede conectarse a la base (REVOKE ALL FROM PUBLIC)
+  community.postgresql.postgresql_privs:
+    database: "{{ p3_bd_nombre }}"
+    type: database
+    objs: "{{ p3_bd_nombre }}"
+    roles: PUBLIC
+    privs: ALL
+    state: absent
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+
+- name: La aplicación puede conectarse
+  community.postgresql.postgresql_privs:
+    database: "{{ p3_bd_nombre }}"
+    type: database
+    objs: "{{ p3_bd_nombre }}"
+    roles: "{{ p3_bd_usuario_app }}"
+    privs: CONNECT
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+
+- name: Esquema public sin privilegios para PUBLIC
+  community.postgresql.postgresql_privs:
+    database: "{{ p3_bd_nombre }}"
+    type: schema
+    objs: public
+    roles: PUBLIC
+    privs: ALL
+    state: absent
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+
+- name: La aplicación solo usa el esquema (sin CREATE)
+  community.postgresql.postgresql_privs:
+    database: "{{ p3_bd_nombre }}"
+    type: schema
+    objs: public
+    roles: "{{ p3_bd_usuario_app }}"
+    privs: USAGE
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+
+- name: Tablas futuras creadas por las migraciones - solo DML para la aplicación
+  community.postgresql.postgresql_privs:
+    database: "{{ p3_bd_nombre }}"
+    type: default_privs
+    objs: "{{ item.objs }}"
+    privs: "{{ item.privs }}"
+    schema: public
+    target_roles: "{{ p3_bd_usuario_migrador }}"
+    roles: "{{ p3_bd_usuario_app }}"
+    login_unix_socket: "{{ p3_pg_socket }}"
+    port: "{{ p3_puerto_bd }}"
+  become: true
+  become_user: postgres
+  loop:
+    - { objs: TABLES, privs: "SELECT,INSERT,UPDATE,DELETE" }
+    - { objs: SEQUENCES, privs: "USAGE,SELECT" }
+  loop_control:
+    label: "{{ item.objs }}"
+
+- name: Leer el certificado de la CA (se instala en los Pages)
+  ansible.builtin.slurp:
+    src: /root/p3-ca/ca.crt
+  register: p3_bd_ca
+
+- name: Publicar el certificado de la CA para los Pages
+  ansible.builtin.set_fact:
+    p3_bd_ca_pem: "{{ p3_bd_ca.content | b64decode }}"
