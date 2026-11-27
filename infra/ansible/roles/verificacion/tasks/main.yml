@@ -1,0 +1,197 @@
+---
+# Pruebas de los capítulos 03, 08, 12, 16 y 20 (positivas y negativas). Si alguna
+# falla, el pipeline falla: la configuración no queda "a medias" sin que se note.
+
+- name: SELinux en enforcing
+  ansible.builtin.command: getenforce
+  register: p3_getenforce
+  changed_when: false
+  failed_when: p3_getenforce.stdout != 'Enforcing'
+
+- name: firewalld sin servicios por defecto (ni ssh 22, ni cockpit, ni dhcpv6-client)
+  ansible.builtin.command: firewall-cmd --zone=public --list-services
+  register: p3_fw_servicios
+  changed_when: false
+  failed_when: p3_fw_servicios.stdout | trim | length > 0
+
+- name: Configuración efectiva de sshd (sshd -T)
+  ansible.builtin.command: sshd -T
+  register: p3_sshd_t
+  changed_when: false
+
+- name: sshd cumple la política de la guía
+  ansible.builtin.assert:
+    that:
+      - p3_sshd_t.stdout_lines is contains('port ' ~ p3_puerto_ssh)
+      - p3_sshd_t.stdout_lines is contains('listenaddress ' ~ p3_ip ~ ':' ~ p3_puerto_ssh)
+      - p3_sshd_t.stdout_lines is contains('permitrootlogin no')
+      - p3_sshd_t.stdout_lines is contains('passwordauthentication no')
+      - p3_sshd_t.stdout_lines is contains('permitemptypasswords no')
+      - p3_sshd_t.stdout_lines is contains('usepam yes')
+      - p3_sshd_t.stdout_lines is contains('kbdinteractiveauthentication yes')
+      - p3_sshd_t.stdout_lines is contains('authenticationmethods publickey,keyboard-interactive:pam')
+      - p3_sshd_t.stdout_lines is contains('pubkeyacceptedalgorithms rsa-sha2-512,rsa-sha2-256')
+      - p3_sshd_t.stdout_lines is contains('x11forwarding no')
+      - p3_sshd_t.stdout_lines is contains('allowtcpforwarding no')
+      - p3_sshd_t.stdout_lines is contains('allowagentforwarding no')
+      - p3_sshd_t.stdout_lines is contains('permittunnel no')
+      - p3_sshd_t.stdout_lines is contains('gssapiauthentication no')
+      - p3_sshd_t.stdout_lines is contains('hostbasedauthentication no')
+      - p3_sshd_t.stdout is not search('(?m)^subsystem sftp')
+      - p3_sshd_t.stdout is not search('(?m)^hostkey .*ecdsa')
+    fail_msg: "sshd -T no coincide con la política en {{ inventory_hostname }}."
+    quiet: true
+
+- name: Puertos TCP en escucha
+  ansible.builtin.command: ss -Hlnt
+  register: p3_ss
+  changed_when: false
+
+- name: SSH solo en la IP privada y en el puerto de la guía (nada en el 22)
+  ansible.builtin.assert:
+    that:
+      - p3_ss.stdout is search(p3_ip ~ ':' ~ p3_puerto_ssh)
+      - p3_ss.stdout is not search('[:\s]22\s')
+    fail_msg: "Escucha inesperada: {{ p3_ss.stdout_lines }}"
+    quiet: true
+
+# --- Bastión (cap. 16) -------------------------------------------------------------
+- name: Bastión - pruebas de sudo y aislamiento de llaves
+  when: inventory_hostname in groups['bastion']
+  block:
+    - name: coriander sin sudo
+      ansible.builtin.command: sudo -l -U {{ p3_usuario_admin }}
+      register: p3_sudo_coriander
+      changed_when: false
+      failed_when: p3_sudo_coriander.stdout is search('may run the following')
+
+    - name: celery con sudo (ALL) y contraseña
+      ansible.builtin.command: sudo -l -U {{ p3_usuario_sudoer_bastion }}
+      register: p3_sudo_celery
+      changed_when: false
+      failed_when: p3_sudo_celery.stdout is not search("\\(ALL ?. ?ALL\\) (PASSWD. )?ALL")
+
+    - name: coriander no puede leer las llaves ni el TOTP de celery
+      ansible.builtin.command: runuser -u {{ p3_usuario_admin }} -- ls /home/{{ p3_usuario_sudoer_bastion }}/{{ item }}
+      register: p3_aislamiento
+      changed_when: false
+      failed_when: p3_aislamiento.rc == 0
+      loop: [.ssh, .otp]
+
+    - name: celery no está en AllowUsers (no entra por SSH)
+      ansible.builtin.assert:
+        that: p3_sshd_t.stdout_lines is not contains('allowusers ' ~ p3_usuario_sudoer_bastion)
+        quiet: true
+
+    - name: Llaves de celery con permisos 600
+      ansible.builtin.find:
+        paths: /home/{{ p3_usuario_sudoer_bastion }}/.ssh
+        patterns: "*_rsa"
+      register: p3_llaves_privadas
+
+    - name: Ninguna llave privada es legible por otros
+      ansible.builtin.assert:
+        that: p3_llaves_privadas.files | map(attribute='mode') | unique | list == ['0600']
+        quiet: true
+
+# --- Balanceador (cap. 12 y 20) ------------------------------------------------------
+- name: Balanceador - Round Robin y aislamiento de la base de datos
+  when: inventory_hostname in groups['balanceadores']
+  block:
+    - name: Cada Page responde al balanceador por la red privada
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[item]['p3_ip'] }}/nodo"
+        return_content: true
+      register: p3_directo
+      loop: "{{ groups['web'] }}"
+
+    - name: Diez peticiones al balanceador
+      ansible.builtin.uri:
+        url: http://127.0.0.1/nodo
+        return_content: true
+      register: p3_rr
+      loop: "{{ range(10) | list }}"
+
+    - name: Las respuestas alternan entre todos los Pages
+      ansible.builtin.assert:
+        that: (p3_rr.results | map(attribute='content') | map('trim') | unique | sort) == (groups['web'] | map('extract', hostvars, 'p3_nombre') | sort)
+        fail_msg: "Respuestas: {{ p3_rr.results | map(attribute='content') | map('trim') | list }}"
+        quiet: true
+
+    - name: Cadena completa balanceador -> NGINX del Page -> API (/healthz)
+      ansible.builtin.uri:
+        url: http://127.0.0.1/healthz
+        return_content: true
+      register: p3_cadena
+      loop: "{{ range(groups['web'] | length) | list }}"
+      failed_when: p3_cadena.status != 200 or p3_cadena.json.status | default('') != 'ok'
+
+    - name: Desde el balanceador la base de datos NO es alcanzable (cap. 20)
+      ansible.builtin.wait_for:
+        host: "{{ p3_ip_bd }}"
+        port: "{{ p3_puerto_bd }}"
+        state: stopped
+        connect_timeout: 3
+        timeout: 10
+
+# --- Pages ------------------------------------------------------------------------------
+- name: Pages - API, base de datos y HTTP privado
+  when: inventory_hostname in groups['web']
+  block:
+    - name: TCP hacia PostgreSQL por la red privada
+      ansible.builtin.wait_for:
+        host: "{{ p3_ip_bd }}"
+        port: "{{ p3_puerto_bd }}"
+        timeout: 10
+
+    - name: Paquetes instalados
+      ansible.builtin.package_facts:
+        manager: rpm
+
+    - name: Apache no está instalado
+      ansible.builtin.assert:
+        that: "'httpd' not in ansible_facts.packages"
+        quiet: true
+
+    - name: El Page rechaza a quien no sea el balanceador (403)
+      ansible.builtin.uri:
+        url: "http://{{ p3_ip }}/nodo"
+        status_code: 403
+
+    - name: La API está lista (/readyz)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ p3_app_puerto | default(8080) }}/readyz"
+
+# --- Base de datos (cap. 08-09) -------------------------------------------------------
+- name: Base de datos - escucha, TLS y privilegios
+  when: inventory_hostname in groups['bd']
+  block:
+    - name: PostgreSQL solo en 127.0.0.1 y la IP privada; nada en 0.0.0.0 ni en 5432
+      ansible.builtin.assert:
+        that:
+          - p3_ss.stdout is search('127\.0\.0\.1:' ~ p3_puerto_bd)
+          - p3_ss.stdout is search(p3_ip ~ ':' ~ p3_puerto_bd)
+          - p3_ss.stdout is not search('0\.0\.0\.0:' ~ p3_puerto_bd)
+          - p3_ss.stdout is not search(':5432\s')
+        quiet: true
+
+    - name: TLS activo y cuenta de la aplicación sin privilegios de esquema
+      community.postgresql.postgresql_query:
+        db: edutrak
+        query: >-
+          SELECT current_setting('ssl') AS ssl,
+                 (SELECT rolsuper FROM pg_roles WHERE rolname = 'edutrak_app') AS app_super,
+                 has_schema_privilege('edutrak_app', 'public', 'CREATE') AS app_create
+        login_unix_socket: /run/postgresql
+        port: "{{ p3_puerto_bd }}"
+      become: true
+      become_user: postgres
+      register: p3_pg
+
+    - name: Resultado esperado (ssl=on, sin superusuario, sin CREATE)
+      ansible.builtin.assert:
+        that:
+          - p3_pg.query_result[0].ssl == 'on'
+          - not p3_pg.query_result[0].app_super
+          - not p3_pg.query_result[0].app_create
+        quiet: true

@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+# Accesos administrativos desde el bastión (guía, cap. 13). Uso: ssh <alias>
+# Cada llave tiene frase de paso; cada nodo pide además la contraseña y el TOTP
+# de su usuario.
+{% for llave in p3_llaves_celery %}
+Host {{ llave.alias }}
+    HostName {{ llave.ip }}
+    User {{ llave.usuario }}
+    Port {{ llave.puerto }}
+    IdentityFile ~/.ssh/{{ llave.archivo }}
+
+{% endfor %}
+Host *
+    IdentitiesOnly yes
+    StrictHostKeyChecking yes
+    HashKnownHosts no
+    ForwardAgent no
+    ForwardX11 no
+    HostKeyAlgorithms ssh-ed25519,rsa-sha2-512

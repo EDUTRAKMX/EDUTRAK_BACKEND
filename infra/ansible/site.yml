@@ -1,0 +1,124 @@
+---
+# Práctica 3 - Infraestructura web segura sobre AWS.
+# Orden: base y hardening (SSH + PAM) en las 5 máquinas -> BD -> Pages -> balanceador
+# -> bastión (llaves de celery) -> verificación -> cierre de la cuenta temporal.
+
+- name: Comprobaciones previas en el controlador
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Verificar que llegaron los secretos (secretos_lab.py asegurar)
+      ansible.builtin.assert:
+        that:
+          - p3_secretos is defined
+          - p3_secretos.usuarios is mapping
+          - p3_secretos.bd_app_password | length >= 32
+        fail_msg: "Falta -e @secretos.json; genéralo con infra/scripts/secretos_lab.py asegurar."
+        quiet: true
+
+    - name: Verificar la llave pública del administrador (RSA, de PuTTYgen)
+      ansible.builtin.assert:
+        that:
+          - p3_llave_publica_admin is defined
+          - p3_llave_publica_admin is match('^ssh-rsa ')
+        fail_msg: "Pasa -e p3_llave_publica_admin='ssh-rsa AAAA...' (puttygen llave.ppk -O public-openssh)."
+        quiet: true
+
+- name: Base, usuarios, PAM y SSH en las 5 máquinas
+  hosts: all
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Esperar la conexión (cloud-init movió sshd al puerto de la guía)
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+        sleep: 10
+
+    - name: Esperar a que cloud-init termine
+      ansible.builtin.command: cloud-init status --wait
+      register: p3_cloud_init
+      changed_when: false
+      failed_when: p3_cloud_init.rc not in [0, 2]
+
+    - name: Recolectar hechos
+      ansible.builtin.setup:
+  roles:
+    - comun
+    - usuarios
+    - pam_endurecido
+    - ssh_endurecido
+
+- name: Base de datos PostgreSQL
+  hosts: bd
+  become: true
+  roles:
+    - basedatos
+
+- name: Servidores web Page-1 y Page-2 (API EDUTRAK)
+  hosts: web
+  become: true
+  # Uno a la vez: mientras un Page se actualiza, el balanceador usa el otro.
+  serial: 1
+  roles:
+    - servidor_web
+
+- name: Balanceador NGINX Round Robin
+  hosts: balanceadores
+  become: true
+  roles:
+    - balanceador
+
+- name: Bastión - llaves de celery hacia los nodos internos
+  hosts: bastion
+  become: true
+  roles:
+    - bastion
+
+- name: Nodos internos - autorizar solo la llave de celery que les corresponde
+  hosts: internos
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Llave de celery en authorized_keys (solo desde el bastión)
+      ansible.posix.authorized_key:
+        user: "{{ p3_usuario_admin }}"
+        key: "{{ hostvars[groups['bastion'][0]]['p3_llaves_publicas'][inventory_hostname] }}"
+        key_options: 'from="{{ p3_ip_bastion }}",restrict,pty'
+        exclusive: true
+        state: present
+
+- name: Verificación (pruebas positivas y negativas de la guía)
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - verificacion
+
+- name: Verificación desde el controlador (MFA exigido en el bastión)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Pruebas de acceso al bastión
+      ansible.builtin.include_tasks: tareas/verificar_desde_controlador.yml
+
+- name: Cierre - nodos internos (sin la cuenta temporal)
+  hosts: internos
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Retirar la cuenta de aprovisionamiento
+      ansible.builtin.include_role:
+        name: cierre
+      when: p3_bloquear_aprovisionamiento | bool
+
+- name: Cierre - bastión (al final; es el salto hacia los demás)
+  hosts: bastion
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Retirar la cuenta de aprovisionamiento
+      ansible.builtin.include_role:
+        name: cierre
+      when: p3_bloquear_aprovisionamiento | bool

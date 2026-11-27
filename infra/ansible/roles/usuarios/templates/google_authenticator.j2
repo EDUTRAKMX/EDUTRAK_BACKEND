@@ -1,0 +1,8 @@
+{{ p3_secreto_usuario.totp }}
+" RATE_LIMIT 3 30
+" WINDOW_SIZE 3
+" DISALLOW_REUSE
+" TOTP_AUTH
+{% for codigo in p3_secreto_usuario.codigos %}
+{{ codigo }}
+{% endfor %}

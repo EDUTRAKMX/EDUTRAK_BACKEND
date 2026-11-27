@@ -1,0 +1,6 @@
+---
+- name: Reiniciar API
+  ansible.builtin.systemd_service:
+    name: edutrak-api
+    state: restarted
+    daemon_reload: true

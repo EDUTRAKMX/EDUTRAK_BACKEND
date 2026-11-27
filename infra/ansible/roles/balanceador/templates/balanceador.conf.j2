@@ -1,0 +1,40 @@
+# {{ ansible_managed }}
+# Guía, cap. 12. Round Robin es el comportamiento por defecto con pesos iguales.
+upstream servidores_web {
+{% for h in groups['web'] %}
+    server {{ hostvars[h]['p3_ip'] }}:80 max_fails=3 fail_timeout=10s;
+{% endfor %}
+    keepalive 16;
+}
+
+server {
+    listen 0.0.0.0:80 default_server;
+    server_name _;
+    server_tokens off;
+
+    access_log /var/log/nginx/balanceador_access.log principal;
+    error_log  /var/log/nginx/balanceador_error.log;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    # Evidencia del balanceo (cap. 12). Retirar en producción real si no se quiere
+    # revelar la topología.
+    add_header X-Upstream-Server $upstream_addr always;
+
+    location / {
+        proxy_pass http://servidores_web;
+        proxy_bind {{ p3_ip }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Se reemplaza (no se agrega): el cliente no puede inyectar IP falsas.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+    }
+}

@@ -66,6 +66,8 @@ Obligatorias: `DATABASE_URL`, `JWT_SECRET` (≥ 32 bytes). Todo lo demás tiene 
 
 Los puertos de las bases se publican solo en `127.0.0.1`. En producción: PostgreSQL en red privada (no expuesto a Internet), TLS hacia la base (`sslmode=require` o superior) y la API detrás de un proxy TLS. La imagen (`Dockerfile`) corre como usuario no root, trae `api`, `migrate` y `seed`, y define `HEALTHCHECK` sobre `/healthz`.
 
+**Laboratorio en AWS (Práctica 3):** `infra/` crea con Terraform + Ansible, desde el workflow `infra-aws-practica3`, un bastión SSH, un balanceador NGINX, dos nodos con esta API y PostgreSQL, con hardening de SSH y PAM (llave RSA 4096 + contraseña + TOTP). Ver [infra/README.md](infra/README.md).
+
 ## Migraciones
 `migrations/0001…0012`, solo hacia adelante, aplicadas por `go run ./cmd/migrate` (o `docker compose --profile app up`, que lo ejecuta antes de la API). Cada archivo se aplica en una transacción y se registra; ejecutar el comando de nuevo no hace nada. **Nunca se editan migraciones ya aplicadas**: un cambio de esquema es una migración nueva. Las pruebas `internal/platform/database/schema_integration_test.go` cubren BD vacía y *upgrade* con datos previos (0007–0012).
 

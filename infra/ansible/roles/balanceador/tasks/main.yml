@@ -1,0 +1,20 @@
+---
+# Capítulo 12: upstream Round Robin hacia Page-1 y Page-2 por la red privada.
+
+- name: balanceador.conf (Round Robin, cap. 12)
+  ansible.builtin.template:
+    src: balanceador.conf.j2
+    dest: /etc/nginx/conf.d/balanceador.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Recargar nginx
+
+- name: NGINX activo
+  ansible.builtin.systemd_service:
+    name: nginx
+    enabled: true
+    state: started
+
+- name: Aplicar configuración de NGINX
+  ansible.builtin.meta: flush_handlers

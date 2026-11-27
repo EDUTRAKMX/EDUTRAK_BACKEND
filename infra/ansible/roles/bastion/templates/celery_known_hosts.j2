@@ -1,0 +1,4 @@
+{% for llave in p3_llaves_celery %}
+{% set hechos = hostvars[llave.host]['ansible_facts'] %}
+[{{ llave.ip }}]:{{ llave.puerto }} {{ hechos['ssh_host_key_ed25519_public_keytype'] }} {{ hechos['ssh_host_key_ed25519_public'] }}
+{% endfor %}

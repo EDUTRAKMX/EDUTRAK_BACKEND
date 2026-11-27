@@ -1,0 +1,39 @@
+---
+# Binarios compilados en el pipeline (go build): api, migrate y seed.
+p3_app_binarios: ""
+p3_app_version: "local"
+p3_app_puerto: 8080
+# IP del EFS de evidencias (vacío = directorio local, sin compartir entre Pages).
+p3_efs_ip: ""
+p3_app_raiz: /opt/edutrak
+p3_app_estado: /var/lib/edutrak
+p3_app_evidencias: /var/lib/edutrak/evidencia
+p3_app_config: /etc/edutrak
+
+# ALLOWED_NETWORKS de la API (red institucional del QR). Obligatoria en producción.
+p3_app_redes_asistencia: ""
+p3_app_cors: ""
+p3_app_crear_admin: true
+p3_app_admin_numero: "10000001"
+
+p3_bd_nombre: edutrak
+p3_bd_usuario_migrador: edutrak_migrator
+p3_bd_usuario_app: edutrak_app
+
+p3_app_entorno_comun:
+  APP_ENV: production
+  LOG_LEVEL: info
+  HTTP_PORT: "{{ p3_app_puerto | string }}"
+  JWT_SECRET: "{{ p3_secretos.app_jwt_secret }}"
+  # Solo se confía en X-Forwarded-For del NGINX local y del balanceador (cap. 19).
+  TRUSTED_PROXIES: "127.0.0.1/32,{{ p3_ip_balanceador }}/32"
+  ALLOWED_NETWORKS: "{{ p3_app_redes_asistencia }}"
+  CORS_ALLOWED_ORIGINS: "{{ p3_app_cors }}"
+  STORAGE_DIR: "{{ p3_app_evidencias }}"
+  INSTITUTION_TIMEZONE: "{{ p3_zona_horaria }}"
+
+# TLS verificado contra la CA de la base de datos (sslmode=verify-full).
+p3_app_bd_destino: "{{ p3_ip_bd }}:{{ p3_puerto_bd }}/{{ p3_bd_nombre }}"
+p3_app_bd_tls: "sslmode=verify-full&sslrootcert={{ p3_app_config }}/bd-ca.crt"
+p3_app_url_bd: "postgres://{{ p3_bd_usuario_app }}:{{ p3_secretos.bd_app_password }}@{{ p3_app_bd_destino }}?{{ p3_app_bd_tls }}"
+p3_app_url_bd_migrador: "postgres://{{ p3_bd_usuario_migrador }}:{{ p3_secretos.bd_migrador_password }}@{{ p3_app_bd_destino }}?{{ p3_app_bd_tls }}"

@@ -1,0 +1,26 @@
+---
+# Al terminar solo quedan los accesos de la guía (llave + contraseña + TOTP).
+# La cuenta temporal se retira en UN solo paso al final: después ya no tiene sudo.
+
+- name: sshd_config sin la cuenta temporal (validado con sshd -t)
+  ansible.builtin.template:
+    src: "{{ playbook_dir }}/plantillas/sshd_config.j2"
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s
+  vars:
+    p3_ssh_aprovisionamiento: false
+
+- name: Bloquear la cuenta temporal y recargar sshd
+  ansible.builtin.shell: |
+    set -euo pipefail
+    usuario={{ p3_usuario_aprovisionamiento | quote }}
+    rm -f /etc/sudoers.d/90-cloud-init-users
+    rm -f "/home/${usuario}/.ssh/authorized_keys"
+    usermod --lock --expiredate 1 --shell /sbin/nologin "${usuario}"
+    systemctl reload sshd
+  args:
+    executable: /bin/bash
+  changed_when: true

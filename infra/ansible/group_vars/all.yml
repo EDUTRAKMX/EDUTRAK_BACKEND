@@ -1,0 +1,41 @@
+---
+# ---------------------------------------------------------------------------
+# Valores comunes. Las IP, puertos y usuarios de cada máquina vienen del
+# inventario que genera infra/scripts/generar_inventario.py a partir de Terraform:
+#   p3_clave, p3_nombre, p3_rol, p3_ip, p3_ip_publica, p3_puerto_ssh, p3_usuario_admin
+# Los secretos llegan en p3_secretos (-e @secretos.json, ver secretos_lab.py).
+# ---------------------------------------------------------------------------
+p3_proyecto: edutrak-p3
+p3_usuario_aprovisionamiento: "{{ ansible_user | default('ansible') }}"
+# true = al terminar se bloquea la cuenta de aprovisionamiento (solo quedan los
+# accesos de la guía con llave + contraseña + TOTP). El pipeline lo controla.
+p3_bloquear_aprovisionamiento: false
+
+p3_zona_horaria: America/Mexico_City
+p3_actualizar_paquetes: true
+p3_respaldos: /root/respaldos-practica-3
+
+# Topología derivada del inventario.
+p3_ip_bastion: "{{ hostvars[groups['bastion'][0]]['p3_ip'] }}"
+p3_ip_balanceador: "{{ hostvars[groups['balanceadores'][0]]['p3_ip'] }}"
+p3_ip_bd: "{{ hostvars[groups['bd'][0]]['p3_ip'] }}"
+p3_ips_web: "{{ groups['web'] | map('extract', hostvars, 'p3_ip') | list }}"
+# p3_puerto_bd y p3_efs_ip vienen del inventario generado (salidas de Terraform);
+# no se definen aquí porque group_vars tiene más precedencia que el inventario.
+
+# Usuario sudoer local del bastión (no entra por SSH; se llega con "su -").
+p3_usuario_sudoer_bastion: celery
+
+# Cuentas humanas de cada máquina. ssh: puede entrar por SSH; sudo: sudoer con contraseña.
+p3_usuarios_humanos:
+  - nombre: "{{ p3_usuario_admin }}"
+    ssh: true
+    sudo: true
+
+# Reglas de firewalld (puerto + orígenes). Sin orígenes = cualquiera (lo filtra el
+# grupo de seguridad de AWS). Cada grupo las define en su archivo.
+p3_firewall_reglas: []
+
+# SSH
+p3_ssh_sftp: false
+p3_ssh_longitud_rsa: 4096
