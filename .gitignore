@@ -21,3 +21,14 @@ coverage.html
 Thumbs.db
 
 CLAUDE.md
+
+# Infraestructura (Terraform / Ansible): estado, variables locales e inventario generado
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/terraform.tfvars
+infra/terraform/backend.hcl
+infra/ansible/inventario/hosts.yml
+infra/ansible/inventario/ssh_config
+infra/ansible/inventario/known_hosts
+*.ppk

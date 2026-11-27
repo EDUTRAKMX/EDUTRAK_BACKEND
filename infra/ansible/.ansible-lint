@@ -1,0 +1,12 @@
+---
+profile: production
+# Las colecciones vienen en el paquete "ansible"; no descargar nada al validar.
+offline: true
+exclude_paths:
+  - inventario/
+skip_list:
+  # Los nombres de variables y tareas están en español (con acentos) a propósito.
+  - name[casing]
+  # Todas las variables usan el prefijo común "p3_" (espacio de nombres del
+  # proyecto, compartido entre roles); no se usa el nombre de cada rol.
+  - var-naming[no-role-prefix]
